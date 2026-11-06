@@ -61,15 +61,37 @@ def _month_bounds(now: datetime) -> tuple[str, str, int, int]:
     return start.strftime(fmt), end.strftime(fmt), now.day, days_in_month
 
 
+BUDGET_DIMENSIONS = ("team", "agent", "task")
+
+
+def invalid_scopes(budgets: list[dict[str, Any]]) -> list[str]:
+    """Budget entries `check()` cannot evaluate (bad scope or amount) — these
+    used to be skipped silently, which made a typo'd budget look 'ok'."""
+    bad = []
+    for b in budgets:
+        scope = str(b.get("scope", "")) if isinstance(b, dict) else repr(b)
+        dim, sep, value = scope.partition(":")
+        try:
+            amount_ok = float(b.get("monthly_usd")) > 0
+        except (AttributeError, TypeError, ValueError):
+            amount_ok = False
+        if not sep or not value or dim not in BUDGET_DIMENSIONS or not amount_ok:
+            bad.append(scope or "<missing scope>")
+    return bad
+
+
 def _spend_for_scope(
     conn: sqlite3.Connection, dimension: str, value: str, start: str, end: str
-) -> int:
+) -> tuple[int, int]:
+    """(priced spend in micro-USD, number of UNPRICED events) for the window."""
     row = conn.execute(
-        f"""SELECT COALESCE(SUM(cost_micro_usd), 0) AS s FROM usage_events
+        f"""SELECT COALESCE(SUM(cost_micro_usd), 0) AS s,
+                   COALESCE(SUM(CASE WHEN cost_micro_usd IS NULL THEN 1 ELSE 0 END), 0) AS u
+            FROM usage_events
             WHERE {dimension} = ? AND ts_utc >= ? AND ts_utc <= ?""",
         (value, start, end),
     ).fetchone()
-    return int(row["s"] or 0)
+    return int(row["s"] or 0), int(row["u"] or 0)
 
 
 def check(
@@ -82,12 +104,12 @@ def check(
     start, end, elapsed, days_in_month = _month_bounds(now)
     results = []
     for b in budgets:
+        if invalid_scopes([b]):
+            continue  # reported by invalid_scopes(); never evaluated as "ok"
         scope = b["scope"]
         dim, _, value = scope.partition(":")
-        if dim not in ("team", "agent", "task"):
-            continue
         monthly_micro = int(round(float(b["monthly_usd"]) * 1_000_000))
-        spent = _spend_for_scope(conn, dim, value, start, end)
+        spent, unpriced = _spend_for_scope(conn, dim, value, start, end)
         daily_rate = spent / max(elapsed, 1)
         forecast = int(round(daily_rate * days_in_month))
         threshold = float(b.get("alert_at", 0.8))
@@ -97,6 +119,8 @@ def check(
                 "scope": scope,
                 "monthly_usd": b["monthly_usd"],
                 "spent_micro_usd": spent,
+                # Spend on SKUs missing from pricing.yaml is unknown, not zero.
+                "unpriced_events": unpriced,
                 "forecast_micro_usd": forecast,
                 "forecast_low_confidence": elapsed < 3,
                 "forecast_pct_of_budget": round(forecast / monthly_micro * 100, 1)

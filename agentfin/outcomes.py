@@ -12,6 +12,8 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
+from . import reports
+
 KIND_DEFAULTS = {"hours_saved": 75.0, "tickets": 25.0}  # USD per unit
 
 
@@ -48,13 +50,7 @@ def roi_report(
     date_to: str | None = None,
 ) -> list[dict[str, Any]]:
     """Cost-per-outcome per task, ROI ratio, worst-first ordering."""
-    where, params = "1=1", []
-    if date_from:
-        where += " AND ts_utc >= ?"
-        params.append(date_from)
-    if date_to:
-        where += " AND ts_utc <= ?"
-        params.append(date_to)
+    where, params = reports.time_where(date_from, date_to)
     costs = {
         r["task"]: r["cost"]
         for r in conn.execute(
@@ -63,13 +59,7 @@ def roi_report(
             params,
         ).fetchall()
     }
-    owhere, oparams = "1=1", []
-    if date_from:
-        owhere += " AND ts_utc >= ?"
-        oparams.append(date_from)
-    if date_to:
-        owhere += " AND ts_utc <= ?"
-        oparams.append(date_to)
+    owhere, oparams = reports.time_where(date_from, date_to)
     values = {
         r["task"]: r["value"]
         for r in conn.execute(

@@ -29,15 +29,28 @@ def robust_z(value: float, baseline: list[float]) -> float:
     return 0.6745 * (value - med) / mad
 
 
-def _cooldown_ok(conn: sqlite3.Connection, alert_key: str) -> bool:
+def _cooldown_ok(
+    conn: sqlite3.Connection, alert_key: str, day: str | None = None,
+    respect_cooldown: bool = True,
+) -> bool:
     row = conn.execute(
-        "SELECT fired_at, dismissed FROM alert_state WHERE alert_key = ?",
+        "SELECT fired_at, dismissed, detail_json FROM alert_state WHERE alert_key = ?",
         (alert_key,),
     ).fetchone()
     if not row:
         return True
     if row["dismissed"]:
-        return False
+        # A dismissal acknowledges that day's spike only — it must not mute the
+        # scope forever (pre-0.3 behaviour). Old rows without a day stay muted.
+        try:
+            dismissed_day = json.loads(row["detail_json"] or "{}").get("day")
+        except (ValueError, AttributeError):
+            dismissed_day = None
+        if day is None or dismissed_day in (None, day):
+            return False
+        return True
+    if not respect_cooldown:
+        return True
     fired = datetime.fromisoformat(row["fired_at"].replace("Z", "+00:00"))
     hours = (datetime.now(timezone.utc) - fired).total_seconds() / 3600
     return hours >= COOLDOWN_HOURS
@@ -64,8 +77,13 @@ def detect(
     z_threshold: float = Z_THRESHOLD,
     min_multiple: float = MIN_MULTIPLE,
     record: bool = True,
+    respect_cooldown: bool = True,
 ) -> list[dict[str, Any]]:
-    """Return anomalies for the most recent complete day per scope value."""
+    """Return anomalies for the most recent complete day per scope value.
+
+    `respect_cooldown=False` reports every current anomaly even if it already
+    fired in the last 24h (used by CI gates, which must fail on every retry).
+    Dismissed alerts for the same day stay suppressed either way."""
     if dimension not in reports.DIMENSIONS:
         raise ValueError(f"unknown dimension: {dimension!r}")
     scopes = [r[0] for r in conn.execute(
@@ -86,7 +104,7 @@ def detect(
         if abs(z) < z_threshold:
             continue
         alert_key = f"anomaly:{dimension}:{scope}"
-        if not _cooldown_ok(conn, alert_key):
+        if not _cooldown_ok(conn, alert_key, today_row["day"], respect_cooldown):
             continue
         contributors = reports.top_contributors(conn, today_row["day"], by="task")
         alert = {

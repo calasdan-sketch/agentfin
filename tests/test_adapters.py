@@ -53,7 +53,8 @@ def test_provider_openai_shape():
     })
     e = list(ProviderAdapter().parse([line]))[0]
     assert e["provider"] == "openai"
-    assert (e["input_tokens"], e["cache_read_tokens"]) == (200, 50)
+    # cached_tokens is a subset of prompt_tokens: 150 uncached + 50 cached.
+    assert (e["input_tokens"], e["cache_read_tokens"]) == (150, 50)
 
 
 def test_gateway_shape_and_precomputed_cost():

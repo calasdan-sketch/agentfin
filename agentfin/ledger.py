@@ -112,8 +112,13 @@ def _nonneg_tokens(event: dict[str, Any], key: str) -> int:
 
 
 def insert_event(conn: sqlite3.Connection, event: dict[str, Any]) -> bool:
-    """Insert one canonical event. Returns True if inserted, False if duplicate."""
+    """Insert one canonical event. Returns True if inserted, False if duplicate.
+
+    Correction events (is_correction) carry signed token deltas; only regular
+    usage events are clamped to non-negative counts."""
     ts_utc, ts_offset = parse_ts(event["ts"])
+    tok = (lambda e, k: int(e.get(k, 0) or 0)) if event.get("is_correction") \
+        else _nonneg_tokens
     row = {
         "idem_key": event["idem_key"],
         "ts_utc": ts_utc,
@@ -121,10 +126,10 @@ def insert_event(conn: sqlite3.Connection, event: dict[str, Any]) -> bool:
         "provider": event["provider"],
         "model_raw": event["model_raw"],
         "sku": f"{event['provider']}:{event['model_raw']}",
-        "input_tokens": _nonneg_tokens(event, "input_tokens"),
-        "cache_read_tokens": _nonneg_tokens(event, "cache_read_tokens"),
-        "cache_write_tokens": _nonneg_tokens(event, "cache_write_tokens"),
-        "output_tokens": _nonneg_tokens(event, "output_tokens"),
+        "input_tokens": tok(event, "input_tokens"),
+        "cache_read_tokens": tok(event, "cache_read_tokens"),
+        "cache_write_tokens": tok(event, "cache_write_tokens"),
+        "output_tokens": tok(event, "output_tokens"),
         "cost_micro_usd": event.get("cost_micro_usd"),
         "is_correction": 1 if event.get("is_correction") else 0,
         "task": event.get("task") or "unattributed",
