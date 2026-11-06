@@ -14,8 +14,6 @@ the gateway is the system of record for its own spend.
 
 from __future__ import annotations
 
-import json
-from collections.abc import Iterable
 from typing import Any
 
 from .base import Adapter
@@ -24,35 +22,30 @@ from .base import Adapter
 class GatewayAdapter(Adapter):
     name = "gateway"
 
-    def parse(self, lines: Iterable[str]) -> Iterable[dict[str, Any]]:
-        for line in lines:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            d = json.loads(line)
-            route = str(d.get("route", "/"))
-            provider, _, model = route.partition("/")
-            event: dict[str, Any] = {
-                "ts": d.get("ts") or d.get("timestamp"),
-                "provider": provider or "gateway",
-                "model_raw": model or "unknown",
-                "input_tokens": int(d.get("tokens_in", 0) or 0),
-                "output_tokens": int(d.get("tokens_out", 0) or 0),
-                "cache_read_tokens": int(d.get("tokens_cached", 0) or 0),
-                "cache_write_tokens": 0,
-                "task": d.get("project", "") or d.get("task", ""),
-                "agent": d.get("agent", ""),
-                "team": d.get("team", ""),
-                "metadata": {
-                    "run_id": d.get("run_id"),
-                    "trace_id": d.get("trace_id"),
-                    "route": route,
-                },
-            }
-            # Gateway-provided cost wins over re-pricing.
-            if d.get("cost_usd") is not None:
-                event["_gateway_cost_micro"] = int(round(float(d["cost_usd"]) * 1_000_000))
-            rid = d.get("run_id") or d.get("trace_id")
-            if rid:
-                event["idem_key"] = f"gateway:{rid}"
-            yield event
+    def parse_record(self, d: dict[str, Any]) -> dict[str, Any] | None:
+        route = str(d.get("route", "/"))
+        provider, _, model = route.partition("/")
+        event: dict[str, Any] = {
+            "ts": d.get("ts") or d.get("timestamp"),
+            "provider": provider or "gateway",
+            "model_raw": model or "unknown",
+            "input_tokens": int(d.get("tokens_in", 0) or 0),
+            "output_tokens": int(d.get("tokens_out", 0) or 0),
+            "cache_read_tokens": int(d.get("tokens_cached", 0) or 0),
+            "cache_write_tokens": 0,
+            "task": d.get("project", "") or d.get("task", ""),
+            "agent": d.get("agent", ""),
+            "team": d.get("team", ""),
+            "metadata": {
+                "run_id": d.get("run_id"),
+                "trace_id": d.get("trace_id"),
+                "route": route,
+            },
+        }
+        # Gateway-provided cost wins over re-pricing.
+        if d.get("cost_usd") is not None:
+            event["_gateway_cost_micro"] = int(round(float(d["cost_usd"]) * 1_000_000))
+        rid = d.get("run_id") or d.get("trace_id")
+        if rid:
+            event["idem_key"] = f"gateway:{rid}"
+        return event
