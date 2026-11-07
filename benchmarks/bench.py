@@ -111,10 +111,11 @@ def throughput(tmp: Path, n: int) -> None:
     args = ["--db", db, "--config-dir", cfg]
 
     def timed(label, argv):
-        t = time.perf_counter()
+        t, c = time.perf_counter(), time.process_time()
         res = runner.invoke(main, [*args, *argv])
-        dt = time.perf_counter() - t
-        print(f"  {label:<26}{dt:>8.2f}s  ({n / dt:>9,.0f} events/s)")
+        dt, cpu = time.perf_counter() - t, time.process_time() - c
+        # wall time swings with machine load; CPU time is the steadier number
+        print(f"  {label:<26}{dt:>8.2f}s wall {cpu:>6.2f}s cpu  ({n / dt:>9,.0f} events/s)")
         return res
 
     print(f"== throughput ({n:,} synthetic events)")

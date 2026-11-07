@@ -89,7 +89,60 @@ def _fx_convert(micro, currency, fx_rates) -> tuple[str, bool]:
     return f"{usd * rate:,.2f} {currency.upper()}*", True
 
 
-@click.group()
+class _FriendlyGroup(click.Group):
+    """Turn environment problems (damaged ledger, broken YAML, no permission,
+    full disk, closed pipe) into one plain line and exit 1, never a traceback.
+    Genuine bugs still raise, so they can be reported with their traceback."""
+
+    def invoke(self, ctx):
+        try:
+            return super().invoke(ctx)
+        except click.ClickException:
+            raise
+        except click.exceptions.Exit:
+            raise
+        except BrokenPipeError:
+            try:  # reader (e.g. `| head`) went away: not an error; silence the exit flush
+                sys.stdout = open(os.devnull, "w")  # noqa: SIM115
+            except OSError:
+                pass
+            sys.exit(0)
+        except sqlite3.DatabaseError as exc:
+            msg = str(exc).lower()
+            if "locked" in msg or "busy" in msg:
+                why = "the ledger is busy (another agentfin is writing); try again in a moment"
+            elif "not a database" in msg or "malformed" in msg or "encrypted" in msg:
+                why = ("the ledger file is not a readable agentfin database or is damaged; "
+                       "restore it from a backup or point --db at a different file")
+            elif "readonly" in msg or "read-only" in msg or "unable to open" in msg:
+                why = "the ledger cannot be opened for writing (permissions or read-only disk)"
+            elif "full" in msg:
+                why = "the disk is full"
+            else:
+                why = textsafe.clean(str(exc), 200)
+            raise click.ClickException(why) from None
+        except yaml.YAMLError as exc:
+            mark = getattr(exc, "problem_mark", None)
+            where = f" (line {mark.line + 1})" if mark is not None else ""
+            raise click.ClickException(
+                f"a config file is not valid YAML{where}: "
+                f"{textsafe.clean(getattr(exc, 'problem', None) or 'syntax error', 120)}. "
+                "Fix it, or run `agentfin init --force` to rewrite the defaults"
+            ) from None
+        except PermissionError as exc:
+            raise click.ClickException(
+                f"permission denied: {textsafe.clean(exc.filename or exc, 200)}") from None
+        except OSError as exc:
+            raise click.ClickException(
+                f"file problem: {textsafe.clean(exc.strerror or exc, 120)}"
+                + (f" ({textsafe.clean(exc.filename, 200)})" if exc.filename else "")
+            ) from None
+        except UnicodeDecodeError:
+            raise click.ClickException(
+                "a config file is not valid UTF-8 text; re-save it as UTF-8") from None
+
+
+@click.group(cls=_FriendlyGroup)
 @click.version_option(__version__, prog_name="agentfin")
 @click.option("--db", default=None, help="SQLite db path")
 @click.option("--config-dir", default=None, help="Config dir (pricing/rules/budgets)")
@@ -103,7 +156,10 @@ def main(ctx, db, config_dir):
     ctx.ensure_object(dict)
     paths = _paths(db, config_dir)
     ctx.obj["paths"] = paths
-    ctx.obj["config"] = _load_config(paths)
+    # `init --force` is the repair path for a broken config, so it must not read it;
+    # `demo` uses its own throwaway config.
+    ctx.obj["config"] = {} if ctx.invoked_subcommand in ("init", "demo") \
+        else _load_config(paths)
 
 
 @main.command()
@@ -141,6 +197,25 @@ MAX_REPORTED_ERRORS = 10
 
 
 PRICE_BOOK_STALE_DAYS = 60
+def _open_text(src: str):
+    """Open an input file (or stdin for `-`) as text. UTF-8 with or without a BOM,
+    and UTF-16 with a BOM (what Windows PowerShell 5's `>` writes) both work."""
+    if src == "-":
+        buf = sys.stdin.buffer
+        if not hasattr(buf, "peek"):
+            buf = io.BufferedReader(buf)
+        try:
+            head = buf.peek(2)[:2]
+        except (ValueError, OSError):
+            head = b""
+        enc = "utf-16" if head in (b"\xff\xfe", b"\xfe\xff") else "utf-8-sig"
+        return io.TextIOWrapper(buf, encoding=enc, errors="replace")
+    with open(src, "rb") as raw:
+        head = raw.read(2)
+    enc = "utf-16" if head in (b"\xff\xfe", b"\xfe\xff") else "utf-8-sig"
+    return open(src, encoding=enc, errors="replace")
+
+
 MAX_LINE_CHARS = 16 * 1024 * 1024  # a usage record is a few hundred bytes
 
 
@@ -162,6 +237,34 @@ def _bounded_lines(fh):
             yield lineno, None
             continue
         yield lineno, chunk
+
+
+@main.command()
+def demo():
+    """Try agentfin on built-in SYNTHETIC data, in a throwaway ledger.
+
+    Nothing is written to your own ledger or config; the temporary files are
+    deleted when it finishes. Use it to see what the reports look like.
+    """
+    import contextlib
+    import tempfile
+    from importlib import resources
+
+    src = resources.files("agentfin") / "demo_data" / "projects"
+    with tempfile.TemporaryDirectory(prefix="agentfin-demo-") as td:
+        common = ["--config-dir", str(Path(td) / "cfg")]
+        with contextlib.redirect_stdout(io.StringIO()):
+            main.main(args=[*common, "init", "--config-dir", str(Path(td) / "cfg")],
+                      standalone_mode=False)
+        with resources.as_file(src) as real:
+            click.echo("Synthetic data (made up; not your usage). Your own ledger is untouched.\n")
+            click.echo("$ agentfin ingest --adapter claude-code <demo folder>")
+            main.main(args=[*common, "ingest", "--adapter", "claude-code", str(real)],
+                      standalone_mode=False)
+            click.echo("\n$ agentfin report --by task")
+            main.main(args=[*common, "report", "--by", "task"], standalone_mode=False)
+    click.echo("\nNext: `agentfin init`, then `agentfin ingest --adapter claude-code` "
+               "to read your own Claude Code usage.")
 
 
 def _expand_inputs(files, adapter) -> list[str]:
@@ -250,11 +353,7 @@ def ingest(ctx, files, adapter, no_redact, dry_run, strict):
             fail(where, exc)
 
     for src in sources:
-        fh = (
-            io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8-sig",
-                             errors="replace")
-            if src == "-" else open(src, encoding="utf-8-sig", errors="replace")
-        )
+        fh = _open_text(src)
         label = "<stdin>" if src == "-" else src
         try:
             for lineno, line in _bounded_lines(fh):
@@ -346,8 +445,16 @@ def _require_db(ctx) -> None:
     db = ctx.obj["paths"]["db"]
     if db != ":memory:" and not Path(db).is_file():
         raise click.ClickException(
-            f"ledger not found: {db} (refusing to pass a gate on a missing database)"
+            f"ledger not found at {db}. Run `agentfin init` and then `agentfin ingest ...` "
+            "first (or point --db / --config-dir at your existing ledger)"
         )
+
+
+def _open(ctx):
+    """Open an EXISTING ledger. Read/report commands never create one: a typo'd
+    path or a forgotten `init` must not look like 'no spend'."""
+    _require_db(ctx)
+    return ledger.connect(ctx.obj["paths"]["db"])
 
 
 def _money(ctx, micro):
@@ -371,7 +478,7 @@ def _money(ctx, micro):
 def report(ctx, by, date_from, date_to, tz, as_json):
     """Cost report grouped by agent, task, team, model, provider, sku, day, week,
     month or session."""
-    conn = ledger.connect(ctx.obj["paths"]["db"])
+    conn = _open(ctx)
     try:
         if by in reports.BUCKETS:
             rows = reports.summary_bucketed(conn, by, date_from, date_to, tz)
@@ -407,7 +514,7 @@ def report(ctx, by, date_from, date_to, tz, as_json):
 @click.pass_context
 def trends(ctx, dimension, value, days):
     """Daily spend trend (ASCII bars)."""
-    conn = ledger.connect(ctx.obj["paths"]["db"])
+    conn = _open(ctx)
     series = reports.daily_series(conn, dimension, value, days=days)
     conn.close()
     if not series:
@@ -430,7 +537,7 @@ def detect_anomalies(ctx, dimension, days, fail_on_anomaly):
     """Detect spend anomalies with probable cause."""
     if fail_on_anomaly:
         _require_db(ctx)
-    conn = ledger.connect(ctx.obj["paths"]["db"])
+    conn = _open(ctx)
     # As a gate, ignore the 24h display cooldown so a CI retry fails again.
     alerts = anomalies.detect(conn, dimension=dimension, days=days,
                               respect_cooldown=not fail_on_anomaly)
@@ -454,7 +561,7 @@ def detect_anomalies(ctx, dimension, days, fail_on_anomaly):
 @click.pass_context
 def alerts_cmd(ctx, dismiss):
     """List (or dismiss) fired alerts."""
-    conn = ledger.connect(ctx.obj["paths"]["db"])
+    conn = _open(ctx)
     if dismiss:
         ok = anomalies.dismiss(conn, dismiss)
         click.echo("dismissed" if ok else "no such alert")
@@ -473,7 +580,7 @@ def budgets_grp(ctx):
         _budgets_check(ctx)
 
 
-def _budgets_check(ctx, fail_on_alert=False):
+def _budgets_check(ctx, fail_on_alert=False, as_json=False):
     """Show budget status with month-end forecast (alerts fire on forecast)."""
     if fail_on_alert:
         _require_db(ctx)
@@ -484,7 +591,7 @@ def _budgets_check(ctx, fail_on_alert=False):
                    "team:/agent:/task:<name> with a positive monthly_usd)", err=True)
     if fail_on_alert and bad:
         raise click.ClickException("budgets.yaml has invalid entries (see above)")
-    conn = ledger.connect(ctx.obj["paths"]["db"])
+    conn = _open(ctx)
     # check() is idempotent and persists alert state.
     results = budgets.check(conn, blist)
     conn.close()
@@ -493,7 +600,15 @@ def _budgets_check(ctx, fail_on_alert=False):
             raise click.ClickException(
                 "no budgets configured — a budget gate with nothing to check cannot pass"
             )
+        if as_json:
+            click.echo("[]")
+            return
         click.echo("no budgets configured (see budgets.yaml, or `budgets set`)")
+        return
+    if as_json:
+        click.echo(json.dumps(results, default=str, indent=2))
+        if fail_on_alert and any(r["alert"] or r.get("unpriced_events") for r in results):
+            ctx.exit(ALERT_EXIT_CODE)
         return
     for r in results:
         status = "🔴 ALERT: forecast over budget" if r["alert"] else "🟢 ok"
@@ -516,10 +631,11 @@ def _budgets_check(ctx, fail_on_alert=False):
 @click.option("--fail-on-alert", is_flag=True,
               help=f"exit with status {ALERT_EXIT_CODE} if any budget is forecast to "
                    "overrun (CI/cron gate)")
+@click.option("--json", "as_json", is_flag=True, help="machine-readable output")
 @click.pass_context
-def budgets_check_cmd(ctx, fail_on_alert):
+def budgets_check_cmd(ctx, fail_on_alert, as_json):
     """Show budget status with month-end forecast."""
-    _budgets_check(ctx, fail_on_alert)
+    _budgets_check(ctx, fail_on_alert, as_json)
 
 
 @budgets_grp.command("set")
@@ -568,14 +684,14 @@ def outcomes_grp(ctx):
 
 
 def _tag_outcome(ctx, task, kind, value, note):
-    conn = ledger.connect(ctx.obj["paths"]["db"])
+    conn = _open(ctx)
     outcomes.tag_outcome(conn, task, kind, value, note)
     conn.close()
     click.echo(f"tagged outcome on task '{task}': {kind}={value}")
 
 
 def _roi_report(ctx):
-    conn = ledger.connect(ctx.obj["paths"]["db"])
+    conn = _open(ctx)
     rows = outcomes.roi_report(conn)
     conn.close()
     if not rows:
@@ -654,7 +770,7 @@ def reconcile_cmd(ctx, invoice_csv, date_from, date_to, tolerance, fail_on_varia
         raise click.BadParameter("must be a number >= 0", param_hint="--tolerance")
     if fail_on_variance:
         _require_db(ctx)
-    conn = ledger.connect(ctx.obj["paths"]["db"])
+    conn = _open(ctx)
     try:
         result = reconcile.reconcile(conn, invoice_csv, date_from, date_to, tolerance)
     except ValueError as exc:
@@ -687,7 +803,7 @@ def reconcile_cmd(ctx, invoice_csv, date_from, date_to, tolerance, fail_on_varia
 @click.pass_context
 def dashboard_cmd(ctx, out, days):
     """Export a static HTML dashboard."""
-    conn = ledger.connect(ctx.obj["paths"]["db"])
+    conn = _open(ctx)
     blist = budgets.load_budgets(ctx.obj["paths"]["budgets"])
     html_doc = dashboard.generate(conn, blist, days=days)
     conn.close()
@@ -705,12 +821,11 @@ def dashboard_cmd(ctx, out, days):
 @click.pass_context
 def export_cmd(ctx, fmt, out, date_from, date_to):
     """Export the ledger for spreadsheets, BI or FinOps tools (FOCUS)."""
-    conn = ledger.connect(ctx.obj["paths"]["db"])
     try:
-        reports.time_where(date_from, date_to)  # validate before opening --out
+        reports.time_where(date_from, date_to)  # validate before opening ledger/--out
     except ValueError as exc:
-        conn.close()
         raise click.BadParameter(str(exc), param_hint="--from/--to") from None
+    conn = _open(ctx)
     fh = sys.stdout if out == "-" else open(out, "w", encoding="utf-8", newline="")
     try:
         unpriced_rows = 0
@@ -759,7 +874,7 @@ def reprice(ctx):
         rates = pricing.load_pricing(paths["pricing"])
     except (ValueError, yaml.YAMLError) as exc:
         raise click.ClickException(f"pricing.yaml: {exc}") from None
-    conn = ledger.connect(paths["db"])
+    conn = _open(ctx)
     rows = conn.execute(
         """SELECT id, sku, input_tokens, cache_read_tokens, cache_write_tokens,
                   output_tokens, is_correction, metadata_json FROM usage_events
@@ -790,7 +905,7 @@ def reprice(ctx):
 @click.pass_context
 def doctor(ctx):
     """Sanity checks: unpriced SKUs, unattributed events, data coverage."""
-    conn = ledger.connect(ctx.obj["paths"]["db"])
+    conn = _open(ctx)
     tot = reports.totals(conn)
     unpriced = conn.execute(
         "SELECT sku, COUNT(*) c FROM usage_events WHERE cost_micro_usd IS NULL "
@@ -908,7 +1023,7 @@ def close_grp():
 def close_run_cmd(ctx, month, tz, fx_pairs, allow_unpriced, supersede, note):
     """Close MONTH (YYYY-MM): store totals, a digest and the FX rates you give."""
     _require_db(ctx)
-    conn = ledger.connect(ctx.obj["paths"]["db"])
+    conn = _open(ctx)
     try:
         rec = close_mod.run_close(
             conn, month, tz, close_mod.parse_fx(fx_pairs), ctx.obj["paths"]["pricing"],
@@ -929,7 +1044,7 @@ def close_run_cmd(ctx, month, tz, fx_pairs, allow_unpriced, supersede, note):
 def close_verify_cmd(ctx, month):
     """Check a closed month still matches the ledger (exit 3 if it drifted)."""
     _require_db(ctx)
-    conn = ledger.connect(ctx.obj["paths"]["db"])
+    conn = _open(ctx)
     try:
         v = close_mod.verify(conn, month)
     except close_mod.CloseError as exc:
@@ -965,7 +1080,7 @@ def close_journal_cmd(ctx, month, currency, out):
     gl_expense_default, gl_accrual. Column names resemble common journal-import
     templates but have not been tested against any accounting package."""
     _require_db(ctx)
-    conn = ledger.connect(ctx.obj["paths"]["db"])
+    conn = _open(ctx)
     try:
         rows = close_mod.journal_rows(conn, month, ctx.obj["config"], currency)
     except (close_mod.CloseError, ValueError) as exc:
@@ -994,7 +1109,7 @@ def close_journal_cmd(ctx, month, currency, out):
 def allocate_cmd(ctx, by, pool, date_from, date_to, as_json):
     """Showback: share unattributed spend across teams in proportion to their own."""
     _require_db(ctx)
-    conn = ledger.connect(ctx.obj["paths"]["db"])
+    conn = _open(ctx)
     try:
         res = allocate_mod.allocate(conn, date_from, date_to, pool, by)
     except ValueError as exc:
@@ -1026,7 +1141,7 @@ def savings_cmd(ctx, by, date_from, date_to):
     """What prompt caching saved: actual cost vs the same tokens without a cache."""
     _require_db(ctx)
     book = pricing.load_pricing(ctx.obj["paths"]["pricing"])
-    conn = ledger.connect(ctx.obj["paths"]["db"])
+    conn = _open(ctx)
     try:
         res = whatif.cache_savings(conn, book, date_from, date_to, by)
     except ValueError as exc:
@@ -1064,7 +1179,7 @@ def whatif_cmd(ctx, swaps, by, date_from, date_to):
     unknown = [b for b in mapping.values() if pricing.resolve(b, book)[1] is None]
     if unknown:
         raise click.ClickException(f"no price for {', '.join(unknown)} in pricing.yaml")
-    conn = ledger.connect(ctx.obj["paths"]["db"])
+    conn = _open(ctx)
     try:
         res = whatif.model_swap(conn, book, mapping, date_from, date_to, by)
     except ValueError as exc:
@@ -1101,7 +1216,7 @@ def outcomes_git_cmd(ctx, repo, base, merged_list, project, date_from, date_to):
         extra = {textsafe.clean(line) for line in
                  Path(merged_list).read_text(encoding="utf-8", errors="replace").splitlines()
                  if line.strip() and not line.startswith("#")}
-    conn = ledger.connect(ctx.obj["paths"]["db"])
+    conn = _open(ctx)
     try:
         res = gitlink.analyze(conn, repo, base, extra, date_from, date_to, project)
     except (gitlink.GitError, ValueError) as exc:

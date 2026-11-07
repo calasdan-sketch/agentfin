@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.4.0 - unreleased (expert round 4: the stranger's first hour)
+
+Round 4 is additive on the same unreleased line; no version bump (0.4.0 is not
+on PyPI yet, which has 0.2.0). Focus: what someone who types `pip install` gets.
+See `docs/ROUND4.md` for the panel, the scored idea list and what was not tested.
+
+### Fixed
+- **The published files were incomplete**: no `LICENSE` in the wheel or sdist
+  (MIT was declared but the text was missing), no classifiers, keywords or SPDX
+  license expression, and `agentfin/adapters/` had no `__init__.py`. All added;
+  `twine check` passes on both artifacts.
+- **Tracebacks for ordinary problems**: a damaged/non-SQLite ledger, a broken
+  `config.yaml`, a permissions problem and a closed pipe (`... | head`) each print one
+  plain line (exit 1; a closed pipe exits 0 quietly).
+- **`init --force` could not repair a broken `config.yaml`** because the file was read
+  before `init` ran. It no longer reads it.
+- **Typing `report` (or `doctor`, `export`, `dashboard`, ...) before `init` silently
+  created an empty ledger and showed "no spend"**. Read commands now stop with
+  "ledger not found ... run `agentfin init`" (exit 1) and create nothing.
+- UTF-16 input (what Windows PowerShell 5's `>` writes) was reported as every line
+  malformed; it is now read. UTF-8 BOM and CRLF were already fine (tests added).
+- Two writers at once now wait up to 30 s (was 5 s) and then say "the ledger is busy".
+- `export --from bad` is a usage error (2) even when no ledger exists yet.
+
+### Added
+- `agentfin demo`: runs the README example on built-in synthetic data in a throwaway
+  folder, so a pip user can see the output without cloning the repo (the demo data
+  is now inside the wheel).
+- `budgets check --json`.
+- `benchmarks/bench.py` prints CPU time next to wall time.
+- `tests/test_round4.py`: 23 new tests (214 -> 237), including a version-consistency check.
+
+### Changed
+- **Behaviour change:** read commands exit 1 instead of creating an empty ledger when
+  none exists. Scripts that relied on `agentfin report` creating one should run
+  `agentfin init` first.
+- Build needs setuptools >= 77 (SPDX `license = "MIT"`).
+
 ## 0.4.0 - unreleased (expert round 3, same unreleased line)
 
 Panel: attacker (hostile input), performance engineer, finance auditor,

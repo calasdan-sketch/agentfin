@@ -84,7 +84,7 @@ CREATE TABLE IF NOT EXISTS alert_state (
 def connect(db_path: str | Path) -> sqlite3.Connection:
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(str(db_path), timeout=30)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
     conn.executescript(GUARDS)

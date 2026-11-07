@@ -5,7 +5,23 @@ description = "Agent FinOps: cost attribution and ROI for AI agent spend"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "Calas Automations" }]
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["finops", "llm", "ai-agents", "cost-tracking", "claude-code", "token-usage", "focus"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Financial and Insurance Industry",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Office/Business :: Financial",
+  "Topic :: Software Development :: Quality Assurance",
+]
 dependencies = ["click>=8.1", "pyyaml>=6.0", 'tzdata; platform_system == "Windows"']
 
 [project.optional-dependencies]
@@ -15,7 +31,7 @@ dev = ["pytest>=8.0", "ruff>=0.4"]
 agentfin = "agentfin.cli:main"
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
@@ -34,3 +50,6 @@ select = ["E", "F", "W", "I", "UP"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.setuptools.package-data]
+agentfin = ["demo_data/projects/*/*.jsonl"]
