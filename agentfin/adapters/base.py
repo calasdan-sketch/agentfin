@@ -31,6 +31,11 @@ class IngestContext:
 
     def emit(self, raw: dict[str, Any]) -> None:
         event = dict(raw)
+        # Validate numbers first so a bad count gets a clear message instead of
+        # surfacing from the price calculation.
+        signed = bool(event.get("is_correction"))
+        for field in ledger.TOKEN_FIELDS:
+            ledger._token_count(event, field, signed)
         event["provider"] = textsafe.clean(event["provider"])
         event["model_raw"] = textsafe.clean(event["model_raw"])
         event.setdefault("idem_key", ledger.idem_key_for(event))

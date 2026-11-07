@@ -32,7 +32,7 @@ def load_budgets(path: str | Path | None) -> list[dict[str, Any]]:
     p = Path(path)
     if not p.exists():
         return []
-    data = yaml.safe_load(p.read_text()) or {}
+    data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
     return data.get("budgets", []) or []
 
 
@@ -47,7 +47,8 @@ def save_budgets(path: str | Path, blist: list[dict[str, Any]]) -> None:
     p.write_text(
         "# agentfin budgets — monthly caps in USD.\n"
         "# alert_at: fraction of *forecasted* month-end spend that triggers an alert.\n"
-        + yaml.safe_dump({"budgets": blist}, sort_keys=False)
+        + yaml.safe_dump({"budgets": blist}, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
     )
 
 

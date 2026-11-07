@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..ledger import token_value
 from .base import Adapter
 
 
@@ -37,13 +38,13 @@ class JsonlAdapter(Adapter):
             "ts": _first(d, "ts", "timestamp", "created_at", "time"),
             "provider": _first(d, "provider", default="unknown"),
             "model_raw": _first(d, "model", "model_raw", "model_name", default="unknown"),
-            "input_tokens": int(_first(usage, "input_tokens", "input", default=0) or 0),
-            "output_tokens": int(_first(usage, "output_tokens", "output", default=0) or 0),
-            "cache_read_tokens": int(
-                _first(usage, "cache_read_tokens", "cache_read", default=0) or 0
+            "input_tokens": token_value(_first(usage, "input_tokens", "input"), "input_tokens"),
+            "output_tokens": token_value(_first(usage, "output_tokens", "output"), "output_tokens"),
+            "cache_read_tokens": token_value(
+                _first(usage, "cache_read_tokens", "cache_read"), "cache_read_tokens"
             ),
-            "cache_write_tokens": int(
-                _first(usage, "cache_write_tokens", "cache_write", default=0) or 0
+            "cache_write_tokens": token_value(
+                _first(usage, "cache_write_tokens", "cache_write"), "cache_write_tokens"
             ),
             "task": _first(d, "task", "task_name", default=""),
             "agent": _first(d, "agent", "agent_name", default=""),

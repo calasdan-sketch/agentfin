@@ -60,6 +60,8 @@ agentfin ingest --adapter gateway gateway.jsonl # calas-gateway ledger lines
 agentfin ingest --adapter otel spans.jsonl      # OpenTelemetry GenAI spans (OTLP JSON lines)
 agentfin ingest --adapter jsonl logs/           # your own shape; dirs and `-` (stdin) work
 agentfin report --by team --from 2026-10-01 --to 2026-10-31   # --to is inclusive
+agentfin report --by day --tz America/Chicago   # also week, month (cut in your zone) and session
+agentfin ingest --dry-run --adapter jsonl usage.jsonl   # count and price, write nothing
 agentfin anomalies                              # spikes + probable cause
 agentfin budgets set team:platform 500          # create/update a monthly cap
 agentfin budgets check --fail-on-alert          # exit 3 if forecast to overrun (CI/cron)
@@ -75,8 +77,11 @@ agentfin close journal 2026-10 --currency CAD --out journal.csv
 agentfin export --format focus --out focus.csv  # FinOps FOCUS 1.4 columns
 agentfin export --format csv                    # raw ledger events (also: jsonl)
 agentfin dashboard --out report.html            # static HTML, no server
-agentfin doctor                                 # unpriced SKUs, fuzzy-priced SKUs, gaps
+agentfin reconcile invoice.csv --from 2026-10-01 --to 2026-10-31 --fail-on-variance
+agentfin doctor                                 # unpriced SKUs, fuzzy-priced SKUs, stale price book, gaps
 ```
+
+`python -m agentfin ...` works the same as the `agentfin` command.
 
 Exit codes: `0` ok · `1` error · `2` usage error · `3` a `--fail-on-alert` /
 `--fail-on-anomaly` gate tripped. Gates fail closed: a missing ledger, no
@@ -125,6 +130,7 @@ linked docs did not describe the feature, not that it is impossible.
 | ROI / cost-per-outcome | yes | — | — | — | — |
 | Invoice reconciliation per SKU | yes | — | — | — | — |
 | FOCUS-format export | FOCUS 1.4 mandatory Cost-and-Usage columns, aligned not certified | — | — | — | — |
+| Daily / weekly / monthly / per-session views | `report --by day\|week\|month\|session` (`--tz`) | yes ([docs](https://ccusage.com/guide/)) | — | — | — |
 | Reads OpenTelemetry GenAI spans | yes (`otel` adapter, file input) | — | yes, `gen_ai.usage.*` ([docs](https://langfuse.com/docs/observability/features/token-and-cost-tracking)) | — | — |
 | Month-end close with drift detection and journal | yes | — | — | — | — |
 | Shared-cost (showback) allocation | yes (`allocate`) | — | — | — | — |
@@ -152,10 +158,13 @@ in the request path with key/team budget settings, while agentfin only alerts.
 | measure | result on the development VM (your timings will differ) |
 |---|---|
 | Claude Code transcripts: 2,000 real responses written as 6,555 assistant lines (repeated usage + forked copies) | summing every line gives **3.27x** the true output tokens; agentfin returns exactly the 2,000 responses and 3,005,221 output tokens (seed 20261107) |
-| Ingest 100k events | about 5.6-6.4 s (about 16k events/s); the 0.3.0 code took 5.3 s on the same data, so input sanitizing and the append-only guards cost roughly 10-20% |
-| Re-ingest the same 100k (all duplicates) | about 6 s, ledger unchanged |
-| `report --by task` over 100k events | 0.05 s |
-| `close run` / `close verify` / `close journal` over 100k events | about 0.3 s each |
+| Corrupt lines mixed into good ones (negative counts, millisecond epochs, NaN, 10^30; 986 bad among 5,000 good) | all 986 refused with a message, all 5,000 good lines ingested |
+| Ingest 100k events | 18.8 s on a busy shared VM (about 5.3k events/s). Round 2 recorded 5.6-6.4 s on a quieter run, so timings here swing by 3x with machine load; a same-minute A/B of 30k events showed no consistent difference between the round-2 and round-3 code |
+| Re-ingest the same 100k (all duplicates) | about 23 s on the same busy VM, ledger unchanged |
+| `report --by task` / `--by day --tz America/Chicago` over 100k events | 0.3 s / 1.3 s |
+| `close run` / `close verify` / `close journal` over 100k events | about 1.1-1.2 s each on the busy VM (0.3 s in round 2) |
+
+The accuracy and corrupt-line rows are exact and reproducible; only timings vary.
 
 ## How it works
 
@@ -180,8 +189,14 @@ in the request path with key/team budget settings, while agentfin only alerts.
    anomaly detection (median/MAD, 14-day baseline minimum, 24h cooldown,
    probable-cause attached), budget burn-rate forecasts that alert *before*
    overrun, and ROI from tagged outcomes.
-6. **Trust** — `agentfin reconcile invoice.csv` diffs ledger totals against
-   your actual provider invoice, per SKU.
+6. **Trust** — `agentfin reconcile invoice.csv --from … --to …` diffs ledger
+   totals against your actual provider invoice, per SKU, for the invoice period.
+   The CSV needs a SKU column (`sku` or `model`, written `provider:model`) and a
+   USD column (`cost_usd`, `amount_usd`, `cost` or `amount`); a file without them
+   is an error, never "invoice total $0". Money is added as exact decimals, a SKU
+   that has unpriced events is never called a match, and `--fail-on-variance`
+   exits 3 for cron/CI. Without `--from/--to` it compares the *whole* ledger
+   and says so. Invoice SKUs must equal the ledger's `provider:model` spelling.
 
 ## Config files (in `.agentfin/`)
 
@@ -232,7 +247,13 @@ outcomes [tag|roi|git] · close [run|verify|journal] · allocate · savings ·
 whatif · export · reconcile · reprice · dashboard · doctor`
 
 `ingest` skips malformed lines and reports each as `file:line: reason`, keeping
-the good ones; `--strict` writes nothing if any line is bad.
+the good ones; `--strict` writes nothing if any line is bad. A line is
+malformed if a token count is negative, not a whole number, a boolean or above
+10^12; if a timestamp is before 2015 or more than 2 days in the future (a
+milliseconds-as-seconds or year typo); if a gateway `cost_usd` is negative or
+above $1,000,000; or if it is longer than 16 MiB. (Before this round negative
+counts were silently set to 0.) Device and pipe paths are refused: pass `-` to
+read stdin.
 
 `doctor` surfaces unpriced SKUs and unattributed events — the two things
 that silently ruin FinOps data. `init` refuses to overwrite existing config
@@ -242,7 +263,7 @@ for `outcomes tag` / `outcomes roi`.
 ## Development
 
 ```bash
-python -m pytest        # see CHANGELOG for the current count
+python -m pytest        # 214 tests at this commit
 ruff check agentfin/ tests/
 ```
 
@@ -298,5 +319,14 @@ ruff check agentfin/ tests/
   another SKU and says nothing about quality or retries.
 - **OTel input semantics vary by library.** See the `otel` adapter note above;
   the guess is recorded on the event.
+- **Reconcile is exact-name and USD-only.** Invoice SKUs must be spelled like the
+  ledger's `provider:model`; a provider's own product names, currencies other
+  than USD and credits/refunds as separate lines are not understood. A delimiter
+  other than a comma is an error. Tolerance is a flat amount per SKU.
+- **Sanity limits are guesses.** 10^12 tokens, 2015 to "2 days from now", and
+  $1,000,000 per gateway request are conservative bounds, not provider facts;
+  edit `ledger.py` if your data legitimately exceeds them.
+- **Windows is untested here.** Paths and encodings are handled in code and by an
+  emulated code-page test, but the suite has only been run on Linux.
 - **Outcome values are estimates.** `hours_saved × rate` is a model, not a
   bank deposit. ROI ranks tasks; don't put it in a 10-K.

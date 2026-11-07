@@ -165,19 +165,19 @@ def test_reconcile_cli_clean_error(tmp_path, monkeypatch):
 # -- negative token clamp ---------------------------------------------------
 
 
-def test_negative_tokens_clamped(tmp_path):
+def test_negative_tokens_rejected(tmp_path):
+    """Round 3: a negative count is corrupt data, so the line is rejected with a
+    message instead of being silently clamped to zero."""
+    import pytest
     conn = ledger.connect(tmp_path / "t.db")
     try:
-        assert ledger.insert_event(conn, {
-            "idem_key": "neg1", "ts": "2026-10-19T00:00:00Z",
-            "provider": "openai", "model_raw": "gpt-4o-mini",
-            "input_tokens": -500, "output_tokens": -10,
-            "cost_micro_usd": 0,
-        })
-        row = conn.execute(
-            "SELECT input_tokens, output_tokens FROM usage_events WHERE idem_key='neg1'"
-        ).fetchone()
-        assert row["input_tokens"] == 0
-        assert row["output_tokens"] == 0
+        with pytest.raises(ValueError, match="input_tokens is negative"):
+            ledger.insert_event(conn, {
+                "idem_key": "neg1", "ts": "2026-10-19T00:00:00Z",
+                "provider": "openai", "model_raw": "gpt-4o-mini",
+                "input_tokens": -500, "output_tokens": -10,
+                "cost_micro_usd": 0,
+            })
+        assert conn.execute("SELECT COUNT(*) FROM usage_events").fetchone()[0] == 0
     finally:
         conn.close()

@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.4.0 - unreleased (expert round 3, same unreleased line)
+
+Panel: attacker (hostile input), performance engineer, finance auditor,
+first-time buyer (README only), docs/DX lead, competitor engineer (ccusage,
+LiteLLM). Round 3 is additive on top of round 2 below; no version bump.
+
+### Fixed (found by running the tool, not by reading it)
+- **Negative token counts were silently set to 0**, and NaN, booleans, 10.5 and
+  10^30 got through some adapters. All are now refused per line with a plain
+  message naming the field (correction events may still be negative).
+- **Timestamps like year 1 or 9999 were stored** and later crashed `export
+  --format focus` with a traceback. Events before 2015 or more than 2 days in
+  the future are refused; old bad rows give a clean error, and `doctor` counts them.
+- **Gateway `cost_usd` was trusted blindly**: a negative cost cancelled real
+  spend and an epoch in the wrong column became $1.7 billion. Now 0 to $1,000,000
+  per request, else the line is refused. The ledger also refuses a negative cost
+  on a non-correction event.
+- **`reconcile` treated a wrong header as an invoice of $0** (a file with an
+  `amount` column "matched"). Now: column check, aliases, BOM, `$` and thousands
+  separators, exact decimal sums, NaN/inf rejected, one-sided SKUs labelled,
+  SKUs with unpriced events never "match", output sanitized.
+- `budgets set` accepted `nan`/`inf`; `outcomes tag --value inf` crashed with a
+  traceback. Both are usage errors now.
+- A file with no newline, or `/dev/zero`, was read into memory whole. Lines over
+  16 MiB are skipped; device and pipe paths are refused (use `-`).
+- Windows: YAML/HTML files are read and written as UTF-8 (they used the system
+  code page), and stdout no longer crashes on the arrows and ticks in a legacy
+  code page. Not run on Windows; covered by an emulated cp1252 test only.
+- Error lines read "input_tokens is negative (-5)" instead of
+  "OverflowError: Python int too large to convert to SQLite INTEGER".
+
+### Added
+- `reconcile --from/--to` (invoice period), `--tolerance`, `--fail-on-variance`
+  (exit 3), `--json`.
+- `report --by day|week|month` cut in `--tz` (bare `--from/--to` dates are
+  whole days in that zone) and `--by session` (Claude Code session id).
+- `ingest --dry-run`.
+- `doctor` warns when `pricing.yaml` has not been modified for 60 days (file age
+  only) and counts events with impossible dates.
+- `python -m agentfin`; `benchmarks/bench.py` runs from a checkout and gained a
+  corrupt-line section, `report --by day` and `reconcile` timings.
+- `tests/test_round3.py`: 52 new tests (162 -> 214).
+
+### Changed
+- **Behaviour change:** negative token counts and implausible values are
+  rejected instead of clamped (see Fixed). A pipeline that relied on clamping
+  now sees those lines in the "malformed" list.
+- `reconcile` output flags are `ok` / `XX VARIANCE` (ASCII) and it prints a note
+  when no period was given. The default tolerance stays $0.01 per SKU.
+- `redact()` builds its key set once per call tree, and the clock is read once
+  a second during ingest; together these roughly cancel the new validation cost.
+
 ## 0.4.0 - unreleased (expert round 2)
 
 Expert panel: FinOps practitioner, LLM billing specialist, data engineer,

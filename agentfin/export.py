@@ -90,7 +90,14 @@ def focus_rows(
         params,
     )
     for r in cur:
-        day = date.fromisoformat(r["day"])
+        try:
+            day = date.fromisoformat(r["day"])
+        except ValueError:
+            raise ValueError(
+                f"the ledger holds an event with an invalid date {r['day']!r} "
+                "(written by an older version); find it with `agentfin export "
+                "--format csv` and list it in a correction"
+            ) from None
         last = calendar.monthrange(day.year, day.month)[1]
         tokens = (r["inp"] or 0) + (r["cr"] or 0) + (r["cw"] or 0) + (r["outp"] or 0)
         # FOCUS requires BilledCost. Groups containing unpriced events get 0 and

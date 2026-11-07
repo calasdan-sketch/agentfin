@@ -9,7 +9,8 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -128,10 +129,66 @@ def idem_key_for(record: dict[str, Any]) -> str:
     return "h:" + hashlib.sha256(canonical.encode()).hexdigest()[:32]
 
 
-def _nonneg_tokens(event: dict[str, Any], key: str) -> int:
-    """Token counts can't be negative — a typo'd record must not silently
-    offset real spend with negative costs. Clamp to 0."""
-    return max(int(event.get(key, 0) or 0), 0)
+TOKEN_FIELDS = ("input_tokens", "cache_read_tokens", "cache_write_tokens",
+                "output_tokens")
+MAX_TOKENS = 10**12          # one request cannot plausibly carry a trillion tokens
+MIN_TS = "2015-01-01T00:00:00Z"  # before any LLM API existed: a unit/epoch mistake
+FUTURE_SLACK = timedelta(days=2)  # tolerated clock skew; later is almost surely a typo
+
+
+def _token_count(event: dict[str, Any], key: str, signed: bool = False) -> int:
+    return token_value(event.get(key, 0), key, signed)
+
+
+def token_value(value: Any, key: str, signed: bool = False) -> int:
+    """A token count must be a whole number between 0 and MAX_TOKENS. Anything
+    else (negative, NaN, a bool, 10.5, 2**70) means the record is corrupt, and
+    quietly clamping it would hide a data problem and skew totals, so the line is
+    rejected with a message that names the field. Correction events carry signed
+    deltas and may be negative."""
+    if value is None or value == "":
+        return 0
+    if isinstance(value, bool):
+        raise ValueError(f"{key} must be a number, got {value!r}")
+    try:
+        number = value if isinstance(value, int) else float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{key} is not a number: {textsafe.clean(value, 40)!r}") from None
+    if isinstance(number, float):
+        if number != number or number in (float("inf"), float("-inf")):
+            raise ValueError(f"{key} is not a finite number")
+        if number != int(number):
+            raise ValueError(f"{key} must be a whole number, got {number}")
+        number = int(number)
+    if abs(number) > MAX_TOKENS:
+        raise ValueError(f"{key} is implausibly large ({number}); limit is {MAX_TOKENS}")
+    if number < 0 and not signed:
+        raise ValueError(f"{key} is negative ({number}); a usage record cannot be below zero")
+    return number
+
+
+_clock_memo: tuple[int, str, str] = (0, "", "")
+
+
+def _clock() -> tuple[str, str]:
+    """(now, latest accepted timestamp) as ISO strings, recomputed once a second
+    (an ingest of 100k events would otherwise format the same instant 200k times)."""
+    global _clock_memo
+    sec = int(time.time())
+    if _clock_memo[0] != sec:
+        now = datetime.now(timezone.utc)
+        _clock_memo = (sec, now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                       (now + FUTURE_SLACK).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    return _clock_memo[1], _clock_memo[2]
+
+
+def _check_ts_window(ts_utc: str) -> None:
+    latest = _clock()[1]
+    if ts_utc < MIN_TS or ts_utc > latest:
+        raise ValueError(
+            f"timestamp {ts_utc} is outside the accepted range {MIN_TS[:10]} to "
+            f"2 days from now (wrong unit or a typo?)"
+        )
 
 
 def _tag(value: Any) -> str:
@@ -146,10 +203,20 @@ def insert_event(conn: sqlite3.Connection, event: dict[str, Any]) -> bool:
     Correction events (is_correction) carry signed token deltas; only regular
     usage events are clamped to non-negative counts."""
     ts_utc, ts_offset = parse_ts(event["ts"])
+    _check_ts_window(ts_utc)
+    cost = event.get("cost_micro_usd")
+    if cost is not None and (
+            isinstance(cost, bool) or not isinstance(cost, int)
+            or abs(cost) > MAX_TOKENS * 1_000_000
+            or (cost < 0 and not event.get("is_correction"))):
+        raise ValueError("cost is out of range: a usage event's cost cannot be negative")
     provider = textsafe.clean(event["provider"])
     model_raw = textsafe.clean(event["model_raw"])
-    tok = (lambda e, k: int(e.get(k, 0) or 0)) if event.get("is_correction") \
-        else _nonneg_tokens
+    signed = bool(event.get("is_correction"))
+
+    def tok(e, k):
+        return _token_count(e, k, signed)
+
     row = {
         "idem_key": event["idem_key"],
         "ts_utc": ts_utc,
@@ -167,7 +234,7 @@ def insert_event(conn: sqlite3.Connection, event: dict[str, Any]) -> bool:
         "agent": _tag(event.get("agent")) or "unknown",
         "team": _tag(event.get("team")) or "unassigned",
         "metadata_json": json.dumps(event.get("metadata") or {}),
-        "ingested_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "ingested_at": _clock()[0],
     }
     try:
         conn.execute(

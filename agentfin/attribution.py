@@ -45,7 +45,7 @@ def load_rules(path: str | Path | None) -> dict[str, Any]:
     p = Path(path)
     if not p.exists():
         return {"defaults": {}, "rules": []}
-    return yaml.safe_load(p.read_text()) or {"defaults": {}, "rules": []}
+    return yaml.safe_load(p.read_text(encoding="utf-8")) or {"defaults": {}, "rules": []}
 
 
 def _matches(conditions: dict[str, Any], event: dict[str, Any]) -> bool:

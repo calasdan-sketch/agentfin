@@ -23,6 +23,8 @@ from pathlib import Path
 
 from click.testing import CliRunner
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # run from a checkout
+
 from agentfin import close, ledger
 from agentfin.cli import main
 
@@ -119,6 +121,10 @@ def throughput(tmp: Path, n: int) -> None:
     timed("ingest", ["ingest", str(src)])
     timed("re-ingest (all dupes)", ["ingest", str(src)])
     timed("report --by task", ["report", "--by", "task"])
+    timed("report --by day --tz", ["report", "--by", "day", "--tz", "America/Chicago"])
+    inv = tmp / "invoice.csv"
+    inv.write_text("sku,cost_usd\nanthropic:claude-sonnet-5,1\n", encoding="utf-8")
+    timed("reconcile (1 invoice row)", ["reconcile", str(inv), "--json"])
     month = "2026-10"
     conn = ledger.connect(db)
     t = time.perf_counter()
@@ -135,8 +141,44 @@ def throughput(tmp: Path, n: int) -> None:
     print(f"  {'close journal (CAD)':<26}{time.perf_counter() - t:>8.2f}s")
 
 
+def hostile(tmp: Path) -> None:
+    """Corrupt records mixed into good ones must be refused, and the good ones
+    must still land exactly. Every bad line below is something a real export has
+    contained at some point (negative counts, ms-epoch timestamps, NaN)."""
+    rng = random.Random(SEED)
+    good, bad = 5000, 0
+    base = {"provider": "anthropic", "model": "claude-sonnet-5", "output_tokens": 5}
+    lines = []
+    for i in range(good):
+        lines.append({**base, "id": f"g{i}", "ts": "2026-10-02T10:00:00Z",
+                      "input_tokens": 10})
+        if rng.random() < 0.2:
+            bad += 1
+            lines.append(rng.choice([
+                {**base, "id": f"b{i}", "ts": "2026-10-02T10:00:00Z", "input_tokens": -1},
+                {**base, "id": f"b{i}", "ts": 1760000000000, "input_tokens": 1},
+                {**base, "id": f"b{i}", "ts": "2026-10-02T10:00:00Z",
+                 "input_tokens": "NaN"},
+                {**base, "id": f"b{i}", "ts": "2026-10-02T10:00:00Z",
+                 "input_tokens": 10 ** 30},
+            ]))
+    src = tmp / "hostile.jsonl"
+    src.write_text("\n".join(json.dumps(x) for x in lines) + "\n", encoding="utf-8")
+    cfg, db = str(tmp / "cfg3"), str(tmp / "h.db")
+    runner = CliRunner()
+    runner.invoke(main, ["init", "--config-dir", cfg])
+    res = runner.invoke(main, ["--db", db, "--config-dir", cfg, "ingest", str(src)])
+    first = res.output.splitlines()[0]
+    print("== hostile input (good lines mixed with corrupt ones)")
+    print(f"  good lines {good:,}, corrupt lines {bad:,}")
+    print(f"  ingest said: {first}")
+    assert f"ingested {good} events" in first
+    assert f"{bad} malformed" in res.output
+
+
 if __name__ == "__main__":
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 100_000
     with tempfile.TemporaryDirectory() as d:
         accuracy(Path(d))
+        hostile(Path(d))
         throughput(Path(d), n)

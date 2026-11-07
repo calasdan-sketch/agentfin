@@ -16,7 +16,26 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..ledger import token_value
 from .base import Adapter
+
+MAX_EVENT_COST_USD = 1_000_000  # one request costing more than this is a data error
+
+
+def _gateway_cost(value: Any) -> int:
+    """The gateway's own cost is trusted verbatim, but only if it is a sane
+    amount: a negative cost would silently cancel real spend, and a huge one
+    (an epoch timestamp in the wrong column, say) would swamp every report."""
+    if isinstance(value, bool):
+        raise ValueError("cost_usd must be a number, got a boolean")
+    try:
+        usd = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("cost_usd is not a number") from None
+    if usd != usd or usd < 0 or usd > MAX_EVENT_COST_USD:
+        raise ValueError(
+            f"cost_usd {usd!r} is outside 0 to {MAX_EVENT_COST_USD:,} USD per request")
+    return int(round(usd * 1_000_000))
 
 
 class GatewayAdapter(Adapter):
@@ -29,9 +48,9 @@ class GatewayAdapter(Adapter):
             "ts": d.get("ts") or d.get("timestamp"),
             "provider": provider or "gateway",
             "model_raw": model or "unknown",
-            "input_tokens": int(d.get("tokens_in", 0) or 0),
-            "output_tokens": int(d.get("tokens_out", 0) or 0),
-            "cache_read_tokens": int(d.get("tokens_cached", 0) or 0),
+            "input_tokens": token_value(d.get("tokens_in"), "tokens_in"),
+            "output_tokens": token_value(d.get("tokens_out"), "tokens_out"),
+            "cache_read_tokens": token_value(d.get("tokens_cached"), "tokens_cached"),
             "cache_write_tokens": 0,
             "task": d.get("project", "") or d.get("task", ""),
             "agent": d.get("agent", ""),
@@ -44,7 +63,7 @@ class GatewayAdapter(Adapter):
         }
         # Gateway-provided cost wins over re-pricing.
         if d.get("cost_usd") is not None:
-            event["_gateway_cost_micro"] = int(round(float(d["cost_usd"]) * 1_000_000))
+            event["_gateway_cost_micro"] = _gateway_cost(d["cost_usd"])
         rid = d.get("run_id") or d.get("trace_id")
         if rid:
             event["idem_key"] = f"gateway:{rid}"

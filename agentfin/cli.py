@@ -7,6 +7,7 @@ import json
 import os
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 import click
@@ -71,7 +72,7 @@ def _paths(db, config_dir):
 def _load_config(paths) -> dict:
     p = paths["config"]
     if p.exists():
-        return yaml.safe_load(p.read_text()) or {}
+        return yaml.safe_load(p.read_text(encoding="utf-8")) or {}
     return {}
 
 
@@ -94,6 +95,11 @@ def _fx_convert(micro, currency, fx_rates) -> tuple[str, bool]:
 @click.option("--config-dir", default=None, help="Config dir (pricing/rules/budgets)")
 @click.pass_context
 def main(ctx, db, config_dir):
+    for stream in (sys.stdout, sys.stderr):
+        try:  # a legacy Windows code page must not crash on the arrows and ticks we print
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
     ctx.ensure_object(dict)
     paths = _paths(db, config_dir)
     ctx.obj["paths"] = paths
@@ -125,13 +131,37 @@ def init(config_dir, force):
             "(use --force to overwrite)"
         )
     for name, content in files.items():
-        (cfg / name).write_text(content)
+        (cfg / name).write_text(content, encoding="utf-8")
     conn = ledger.connect(cfg / DEFAULT_DB)
     conn.close()
     click.echo(f"initialized agentfin in {cfg}")
 
 
 MAX_REPORTED_ERRORS = 10
+
+
+PRICE_BOOK_STALE_DAYS = 60
+MAX_LINE_CHARS = 16 * 1024 * 1024  # a usage record is a few hundred bytes
+
+
+def _bounded_lines(fh):
+    """Yield (lineno, text); a line longer than MAX_LINE_CHARS yields (lineno,
+    None) once and the rest of it is dropped, so a file with no newlines (or
+    /dev/zero) cannot exhaust memory."""
+    lineno = 0
+    while True:
+        chunk = fh.readline(MAX_LINE_CHARS + 1)
+        if not chunk:
+            return
+        lineno += 1
+        if len(chunk) > MAX_LINE_CHARS and not chunk.endswith("\n"):
+            while True:  # discard the remainder of this oversize line
+                rest = fh.readline(MAX_LINE_CHARS)
+                if not rest or rest.endswith("\n"):
+                    break
+            yield lineno, None
+            continue
+        yield lineno, chunk
 
 
 def _expand_inputs(files, adapter) -> list[str]:
@@ -158,6 +188,10 @@ def _expand_inputs(files, adapter) -> list[str]:
                     os.path.join(root, n) for n in sorted(names) if n.endswith(".jsonl")
                 )
             out.extend(found)
+        elif f != "-" and not os.path.isfile(f):
+            raise click.ClickException(
+                f"{textsafe.clean(f, 120)}: not a regular file or directory "
+                "(device and pipe paths are refused; pipe data in with `-`)")
         else:
             out.append(f)
     return out
@@ -168,11 +202,13 @@ def _expand_inputs(files, adapter) -> list[str]:
 @click.option("--adapter", type=click.Choice(sorted(ADAPTERS)), default="jsonl",
               show_default=True)
 @click.option("--no-redact", is_flag=True, help="disable PII redaction (not recommended)")
+@click.option("--dry-run", is_flag=True,
+              help="parse, price and count everything but write nothing to the ledger")
 @click.option("--strict", is_flag=True,
               help="abort and write nothing if any line is malformed (default: skip "
                    "bad lines, report them with file:line, keep the good ones)")
 @click.pass_context
-def ingest(ctx, files, adapter, no_redact, strict):
+def ingest(ctx, files, adapter, no_redact, dry_run, strict):
     """Ingest usage records into the ledger.
 
     FILES may be JSONL files, directories (all *.jsonl inside), or `-` for
@@ -201,7 +237,7 @@ def ingest(ctx, files, adapter, no_redact, strict):
     skipped = 0
 
     def fail(where: str, exc: Exception) -> None:
-        errors.append(textsafe.clean(f"{where}: {type(exc).__name__}: {exc}", 300))
+        errors.append(textsafe.clean(f"{where}: {_plain_error(exc)}", 300))
         if strict:
             conn.rollback()
             conn.close()
@@ -221,11 +257,15 @@ def ingest(ctx, files, adapter, no_redact, strict):
         )
         label = "<stdin>" if src == "-" else src
         try:
-            for lineno, line in enumerate(fh, 1):
+            for lineno, line in _bounded_lines(fh):
+                where = f"{label}:{lineno}"
+                if line is None:
+                    fail(where, ValueError(
+                        f"line is longer than {MAX_LINE_CHARS // 1048576} MiB, skipped"))
+                    continue
                 line = line.strip().lstrip("\ufeff")  # BOMs from concatenated files
                 if not line or line.startswith("#"):
                     continue
-                where = f"{label}:{lineno}"
                 try:
                     d = json.loads(line)
                     if not isinstance(d, dict):
@@ -259,10 +299,14 @@ def ingest(ctx, files, adapter, no_redact, strict):
     if aggregates:
         skipped += aggregates
         parser.skipped_aggregates = 0
-    ictx.commit()
+    if dry_run:
+        conn.rollback()  # nothing was committed: counts below are what WOULD happen
+    else:
+        ictx.commit()
     conn.close()
     click.echo(
-        f"ingested {ictx.inserted} events "
+        f"{'dry run, nothing written: would ingest' if dry_run else 'ingested'} "
+        f"{ictx.inserted} events "
         f"({ictx.duplicates} duplicates skipped, {ictx.unpriced} unpriced"
         + (f", {ictx.revised} partial records revised" if ictx.revised else "")
         + (f", {skipped} non-usage lines ignored" if skipped else "") + ")"
@@ -273,6 +317,27 @@ def ingest(ctx, files, adapter, no_redact, strict):
             click.echo(f"    {e}", err=True)
         if len(errors) > MAX_REPORTED_ERRORS:
             click.echo(f"    … and {len(errors) - MAX_REPORTED_ERRORS} more", err=True)
+
+
+def _finite(ctx, param, value):
+    """click callback: reject NaN / inf, which float() happily accepts."""
+    if value is not None and (value != value or value in (float("inf"), float("-inf"))
+                              or abs(value) > 1e12):
+        raise click.BadParameter("must be a finite number below 1e12")
+    return value
+
+
+def _plain_error(exc: Exception) -> str:
+    """Say what is wrong with a line in words, not as a Python exception name."""
+    if isinstance(exc, RecursionError):
+        return "JSON is nested too deeply"
+    if isinstance(exc, OverflowError):
+        return f"number out of range ({exc})"
+    if isinstance(exc, KeyError):
+        return f"missing field {exc}"
+    if isinstance(exc, (ValueError, TypeError)):
+        return str(exc)
+    return f"{type(exc).__name__}: {exc}"
 
 
 def _require_db(ctx) -> None:
@@ -294,18 +359,27 @@ def _money(ctx, micro):
 
 
 @main.command()
-@click.option("--by", "by", type=click.Choice(sorted(reports.DIMENSIONS)), default="team")
+@click.option("--by", "by", default="team", show_default=True,
+              type=click.Choice(sorted(reports.DIMENSIONS) + list(reports.BUCKETS)),
+              help="a dimension, or day / week / month (cut in --tz) / session")
 @click.option("--from", "date_from", default=None)
 @click.option("--to", "date_to", default=None)
+@click.option("--tz", default="UTC", show_default=True,
+              help="time zone for --by day|week|month, e.g. America/Chicago")
 @click.option("--json", "as_json", is_flag=True)
 @click.pass_context
-def report(ctx, by, date_from, date_to, as_json):
-    """Cost report grouped by agent, task, team, model, provider, or sku."""
+def report(ctx, by, date_from, date_to, tz, as_json):
+    """Cost report grouped by agent, task, team, model, provider, sku, day, week,
+    month or session."""
     conn = ledger.connect(ctx.obj["paths"]["db"])
     try:
-        rows = reports.summary(conn, by, date_from, date_to)
+        if by in reports.BUCKETS:
+            rows = reports.summary_bucketed(conn, by, date_from, date_to, tz)
+        else:
+            rows = reports.summary(conn, by, date_from, date_to)
     except ValueError as exc:
-        raise click.BadParameter(str(exc), param_hint="--from/--to") from None
+        hint = "--tz" if "time zone" in str(exc) else "--from/--to"
+        raise click.BadParameter(str(exc), param_hint=hint) from None
     finally:
         conn.close()
     if as_json:
@@ -450,8 +524,9 @@ def budgets_check_cmd(ctx, fail_on_alert):
 
 @budgets_grp.command("set")
 @click.argument("scope")
-@click.argument("monthly_usd", type=float)
+@click.argument("monthly_usd", type=float, callback=_finite)
 @click.option("--alert-at", "alert_at", type=float, default=0.8, show_default=True,
+              callback=_finite,
               help="fraction of forecasted month-end spend that triggers an alert")
 @click.pass_context
 def budgets_set_cmd(ctx, scope, monthly_usd, alert_at):
@@ -520,7 +595,7 @@ def _roi_report(ctx):
 @click.argument("task")
 @click.option("--kind", type=click.Choice(["revenue", "hours_saved", "tickets", "custom"]),
               default="revenue")
-@click.option("--value", type=float, required=True,
+@click.option("--value", type=float, required=True, callback=_finite,
               help="USD for revenue/custom; units for hours_saved/tickets")
 @click.option("--note", default="")
 @click.pass_context
@@ -541,7 +616,7 @@ def outcomes_roi_cmd(ctx):
 @click.argument("task")
 @click.option("--kind", type=click.Choice(["revenue", "hours_saved", "tickets", "custom"]),
               default="revenue")
-@click.option("--value", type=float, required=True,
+@click.option("--value", type=float, required=True, callback=_finite,
               help="USD for revenue/custom; units for hours_saved/tickets")
 @click.option("--note", default="")
 @click.pass_context
@@ -558,25 +633,52 @@ def roi_compat_cmd(ctx):
 
 
 @main.command()
-@click.argument("invoice_csv", type=click.Path(exists=True))
+@click.argument("invoice_csv", type=click.Path(exists=True, dir_okay=False))
+@click.option("--from", "date_from", default=None, help="invoice period start (YYYY-MM-DD)")
+@click.option("--to", "date_to", default=None, help="invoice period end, inclusive")
+@click.option("--tolerance", default=0.01, type=float, show_default=True,
+              help="USD difference per SKU still called a match")
+@click.option("--fail-on-variance", is_flag=True,
+              help="exit 3 if any SKU differs by more than the tolerance (cron/CI)")
+@click.option("--json", "as_json", is_flag=True)
 @click.pass_context
-def reconcile_cmd(ctx, invoice_csv):
-    """Reconcile ledger totals against a provider invoice CSV (sku, cost_usd)."""
+def reconcile_cmd(ctx, invoice_csv, date_from, date_to, tolerance, fail_on_variance,
+                  as_json):
+    """Reconcile ledger totals against a provider invoice CSV.
+
+    The CSV needs a SKU column (`sku` or `model`, as provider:model) and a USD
+    cost column (`cost_usd`, `amount_usd`, `cost` or `amount`). Pass --from/--to
+    for the invoice period, otherwise the WHOLE ledger is compared.
+    """
+    if not (tolerance >= 0 and tolerance < 1e9):
+        raise click.BadParameter("must be a number >= 0", param_hint="--tolerance")
+    if fail_on_variance:
+        _require_db(ctx)
     conn = ledger.connect(ctx.obj["paths"]["db"])
     try:
-        result = reconcile.reconcile(conn, invoice_csv)
+        result = reconcile.reconcile(conn, invoice_csv, date_from, date_to, tolerance)
     except ValueError as exc:
+        raise click.ClickException(textsafe.clean(str(exc), 400)) from None
+    finally:
         conn.close()
-        raise click.ClickException(str(exc)) from None
-    conn.close()
-    for line in result["lines"]:
-        flag = "✓" if line["match"] else "✗ VARIANCE"
-        click.echo(
-            f"{flag} {line['sku']}: ledger ${line['ledger_usd']:,.4f} vs "
-            f"invoiced ${line['invoiced_usd']:,.4f} "
-            f"(Δ ${line['variance_usd']:,.4f})"
-        )
-    click.echo(f"total variance: ${result['total_variance_usd']:,.4f}")
+    if as_json:
+        click.echo(json.dumps(result, indent=2))
+    else:
+        if not (date_from or date_to):
+            click.echo("note: no --from/--to given, comparing the whole ledger")
+        for line in result["lines"]:
+            flag = "ok " if line["match"] else "XX VARIANCE"
+            extra = f" [{line['note']}]" if line["note"] else ""
+            if line["unpriced_events"]:
+                extra += f" [{line['unpriced_events']} UNPRICED events]"
+            click.echo(
+                f"{flag} {line['sku']}: ledger ${line['ledger_usd']:,.4f} vs "
+                f"invoiced ${line['invoiced_usd']:,.4f} "
+                f"(diff ${line['variance_usd']:,.4f}){extra}"
+            )
+        click.echo(f"total variance: ${result['total_variance_usd']:,.4f}")
+    if fail_on_variance and not result["all_match"]:
+        ctx.exit(3)
 
 
 @main.command()
@@ -589,7 +691,7 @@ def dashboard_cmd(ctx, out, days):
     blist = budgets.load_budgets(ctx.obj["paths"]["budgets"])
     html_doc = dashboard.generate(conn, blist, days=days)
     conn.close()
-    Path(out).write_text(html_doc)
+    Path(out).write_text(html_doc, encoding="utf-8")
     click.echo(f"wrote {out}")
 
 
@@ -631,6 +733,8 @@ def export_cmd(ctx, fmt, out, date_from, date_to):
                                  export.EVENT_COLUMNS, fh)
         else:
             n = export.write_jsonl(export.event_rows(conn, date_from, date_to), fh)
+    except ValueError as exc:
+        raise click.ClickException(textsafe.clean(str(exc), 400)) from None
     finally:
         if out != "-":
             fh.close()
@@ -752,7 +856,25 @@ def doctor(ctx):
             "idempotency keys — possible cross-source double-ingest. "
             "Ingest each source exactly once."
         )
+    odd = conn.execute(
+        "SELECT COUNT(*) c FROM usage_events WHERE ts_utc < ? OR ts_utc > ?",
+        (ledger.MIN_TS, ledger._clock()[1]),
+    ).fetchone()["c"]
+    if odd:
+        click.echo(f"⚠ {odd:,} events are dated before 2015 or in the future "
+                   "(written by an older version); they distort daily and monthly "
+                   "reports. Find them with `agentfin export --format csv`.")
     conn.close()
+    try:
+        age_days = (time.time() - os.path.getmtime(ctx.obj["paths"]["pricing"])) / 86400
+    except OSError:
+        age_days = 0
+    if age_days > PRICE_BOOK_STALE_DAYS:
+        click.echo(
+            f"⚠ pricing.yaml was last modified {int(age_days)} days ago. Provider prices "
+            "change; compare it with the provider's pricing page and reconcile to your "
+            "latest invoice (`agentfin reconcile`). (File age only: agentfin cannot "
+            "tell whether the rates are still current.)")
     if tot["unpriced_events"]:
         click.echo("tip: add the SKUs to pricing.yaml, then run `agentfin reprice` "
                    "to fill NULL costs from the new rates.")
