@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.4.0 - unreleased (expert round 2)
+
+Expert panel: FinOps practitioner, LLM billing specialist, data engineer,
+engineering manager, finance controller, skeptical CFO. Findings that drove this
+release: terminal escape sequences in tag/model names reached the screen; Gemini
+usage records were unreadable; OpenTelemetry spans could not be ingested; a
+closed month could silently change after reprice or late ingest; shared spend
+could not be allocated; FOCUS export lacked columns FOCUS 1.4 marks Mandatory;
+nothing linked spend to merged work.
+
+### Added
+- `agentfin close run|verify|journal`: month-end close in a chosen time zone
+  with user-supplied FX, SHA-256 digest of the closed events, drift report
+  (late events vs altered rows, exit 3), balanced journal CSV with exact
+  rounding. Closes are append-only; `--supersede` records a new version.
+- `agentfin allocate`: showback of `unassigned` (or any) spend across teams in
+  exact integer micro-dollars.
+- `agentfin outcomes git`: cost per merged branch, spend on branches that never
+  merged, spend that cannot be linked. Runs local git only, without a shell,
+  with external diff/textconv/fsmonitor disabled; branch names from transcripts
+  are validated before use.
+- `agentfin savings` (prompt-cache savings vs no cache) and `agentfin whatif
+  --swap A=B` (same tokens on another SKU), both from your own price book.
+- `otel` adapter for OpenTelemetry GenAI spans (OTLP JSON lines or Python SDK
+  JSON), with cache split, aggregate-span skipping and cross-source dedupe.
+- Gemini/Vertex `usageMetadata` support in the `provider` adapter (cached
+  tokens split, thoughts tokens billed as output).
+- `modifiers:` in pricing.yaml (user-supplied multipliers by `service_tier`,
+  e.g. a batch discount); `service_tier` read from Claude Code, Anthropic and
+  OpenAI records; `doctor` warns about tiers without a modifier.
+- `benchmarks/bench.py`: seeded, re-runnable accuracy and throughput benchmark.
+- `tests/test_expert2.py`: 46 new tests (116 -> 162).
+
+### Changed
+- FOCUS export now follows FOCUS 1.4: adds BillingAccountId, BillingAccountName,
+  ChargeClass, ChargeFrequency, ContractedCost, HostProviderName,
+  InvoiceIssuerName, PricingQuantity, PricingUnit, ServiceProviderName and
+  drops the old `ProviderName` / `PublisherName`. **Breaking for scripts that
+  read those two columns.**
+- Ledger refuses `DELETE` and any `UPDATE` except filling an unpriced cost
+  (`reprice` still works). Existing ledgers gain the guards on next open.
+- Ingest is about 10-20% slower because every tag and model name is sanitized.
+
+### Security
+- Tags, provider and model names are stripped of ANSI/OSC escape sequences,
+  control characters, bidi overrides and zero-width characters before storage
+  and again before printing; credential-looking strings in tags are redacted.
+- Error text echoed from input files is sanitized the same way.
+
 ## 0.3.0 — unreleased
 
 ### Fixed after the synapse-1 panel review

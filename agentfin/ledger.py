@@ -13,6 +13,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from . import redact as _redact
+from . import textsafe
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS usage_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -48,6 +51,25 @@ CREATE TABLE IF NOT EXISTS outcomes (
     UNIQUE(task, kind, ts_utc, note)
 );
 
+CREATE TABLE IF NOT EXISTS closes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    month TEXT NOT NULL,               -- 'YYYY-MM' in `tz`
+    version INTEGER NOT NULL,          -- 1, 2, ... when a close is superseded
+    tz TEXT NOT NULL,
+    window_start TEXT NOT NULL,        -- UTC, inclusive
+    window_end TEXT NOT NULL,          -- UTC, exclusive
+    events INTEGER NOT NULL,
+    max_event_id INTEGER NOT NULL,
+    cost_micro_usd INTEGER NOT NULL,
+    unpriced_events INTEGER NOT NULL,
+    digest TEXT NOT NULL,              -- sha256 over the closed events
+    price_book_sha TEXT NOT NULL,
+    fx_json TEXT NOT NULL DEFAULT '{}',
+    closed_at TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    UNIQUE(month, version)
+);
+
 CREATE TABLE IF NOT EXISTS alert_state (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     alert_key TEXT NOT NULL UNIQUE,    -- e.g. 'budget:team:backend' or 'anomaly:agent:x'
@@ -64,6 +86,7 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    conn.executescript(GUARDS)
     return conn
 
 
@@ -111,30 +134,38 @@ def _nonneg_tokens(event: dict[str, Any], key: str) -> int:
     return max(int(event.get(key, 0) or 0), 0)
 
 
+def _tag(value: Any) -> str:
+    """Tags come from untrusted files: strip terminal/bidi/zero-width characters
+    and credential-looking strings before they are stored or printed."""
+    return _redact._scrub_string(textsafe.clean(value or ""))
+
+
 def insert_event(conn: sqlite3.Connection, event: dict[str, Any]) -> bool:
     """Insert one canonical event. Returns True if inserted, False if duplicate.
 
     Correction events (is_correction) carry signed token deltas; only regular
     usage events are clamped to non-negative counts."""
     ts_utc, ts_offset = parse_ts(event["ts"])
+    provider = textsafe.clean(event["provider"])
+    model_raw = textsafe.clean(event["model_raw"])
     tok = (lambda e, k: int(e.get(k, 0) or 0)) if event.get("is_correction") \
         else _nonneg_tokens
     row = {
         "idem_key": event["idem_key"],
         "ts_utc": ts_utc,
         "ts_offset": ts_offset,
-        "provider": event["provider"],
-        "model_raw": event["model_raw"],
-        "sku": f"{event['provider']}:{event['model_raw']}",
+        "provider": provider,
+        "model_raw": model_raw,
+        "sku": f"{provider}:{model_raw}",
         "input_tokens": tok(event, "input_tokens"),
         "cache_read_tokens": tok(event, "cache_read_tokens"),
         "cache_write_tokens": tok(event, "cache_write_tokens"),
         "output_tokens": tok(event, "output_tokens"),
         "cost_micro_usd": event.get("cost_micro_usd"),
         "is_correction": 1 if event.get("is_correction") else 0,
-        "task": event.get("task") or "unattributed",
-        "agent": event.get("agent") or "unknown",
-        "team": event.get("team") or "unassigned",
+        "task": _tag(event.get("task")) or "unattributed",
+        "agent": _tag(event.get("agent")) or "unknown",
+        "team": _tag(event.get("team")) or "unassigned",
         "metadata_json": json.dumps(event.get("metadata") or {}),
         "ingested_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
@@ -159,3 +190,31 @@ def query(
     conn: sqlite3.Connection, sql: str, params: tuple = ()
 ) -> list[sqlite3.Row]:
     return list(conn.execute(sql, params))
+
+
+# Append-only enforcement. The only permitted UPDATE of a usage event is filling
+# a NULL (unpriced) cost, which is what `agentfin reprice` does. This is
+# tamper-*evident*, not tamper-proof: anyone with write access to the file can
+# drop the triggers, which is why `agentfin close` also stores a digest.
+GUARDS = """
+CREATE TRIGGER IF NOT EXISTS usage_events_no_delete BEFORE DELETE ON usage_events
+BEGIN SELECT RAISE(ABORT, 'usage_events is append-only: write a correction event'); END;
+CREATE TRIGGER IF NOT EXISTS usage_events_only_fill_cost BEFORE UPDATE ON usage_events
+WHEN NOT (
+    OLD.cost_micro_usd IS NULL
+    AND NEW.id IS OLD.id AND NEW.idem_key IS OLD.idem_key AND NEW.ts_utc IS OLD.ts_utc
+    AND NEW.ts_offset IS OLD.ts_offset AND NEW.provider IS OLD.provider
+    AND NEW.model_raw IS OLD.model_raw AND NEW.sku IS OLD.sku
+    AND NEW.input_tokens IS OLD.input_tokens
+    AND NEW.cache_read_tokens IS OLD.cache_read_tokens
+    AND NEW.cache_write_tokens IS OLD.cache_write_tokens
+    AND NEW.output_tokens IS OLD.output_tokens AND NEW.is_correction IS OLD.is_correction
+    AND NEW.task IS OLD.task AND NEW.agent IS OLD.agent AND NEW.team IS OLD.team
+    AND NEW.metadata_json IS OLD.metadata_json AND NEW.ingested_at IS OLD.ingested_at
+)
+BEGIN SELECT RAISE(ABORT, 'usage_events is append-only: only an unpriced cost may be filled'); END;
+CREATE TRIGGER IF NOT EXISTS closes_no_delete BEFORE DELETE ON closes
+BEGIN SELECT RAISE(ABORT, 'closes is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS closes_no_update BEFORE UPDATE ON closes
+BEGIN SELECT RAISE(ABORT, 'closes is append-only: supersede with a new version'); END;
+"""

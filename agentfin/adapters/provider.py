@@ -22,6 +22,17 @@ split out (1200 above -> 1000 uncached input + 200 cache read). Anthropic's
 cache buckets are already separate, and its 1-hour cache writes
 (usage.cache_creation.ephemeral_1h_input_tokens) are billed at their own rate.
 
+Google Gemini / Vertex (`usageMetadata`):
+    {"responseId": "...", "modelVersion": "gemini-2.5-pro", "createTime": "2026-10-19T09:12:00Z",
+     "usageMetadata": {"promptTokenCount": 1000, "cachedContentTokenCount": 300,
+                       "candidatesTokenCount": 200, "thoughtsTokenCount": 800,
+                       "toolUsePromptTokenCount": 0}}
+`promptTokenCount` includes the cached tokens (split out like OpenAI's), and
+`thoughtsTokenCount` is NOT part of `candidatesTokenCount` but is billed as
+output, so it is added to output. Gemini responses carry no timestamp of their
+own unless the exporter adds one (`createTime`, `ts`, ...); a record without one
+is reported as malformed rather than guessed.
+
 The provider is inferred from the id prefix (msg_ -> anthropic,
 chatcmpl- -> openai) or given explicitly. Attribution tags can ride in an
 optional `agentfin` sidecar object: {"agentfin": {"agent": "...", "team": "...", "task": "..."}}.
@@ -40,7 +51,7 @@ def _infer_provider(d: dict[str, Any]) -> str:
         return "anthropic"
     if rid.startswith("chatcmpl-") or rid.startswith("resp_"):
         return "openai"
-    if "gemini" in str(d.get("model", "")).lower():
+    if "usageMetadata" in d or "gemini" in str(d.get("model") or d.get("modelVersion", "")).lower():
         return "google"
     return "unknown"
 
@@ -49,6 +60,8 @@ class ProviderAdapter(Adapter):
     name = "provider"
 
     def parse_record(self, d: dict[str, Any]) -> dict[str, Any] | None:
+        if isinstance(d.get("usageMetadata"), dict):
+            return self._parse_gemini(d)
         usage = d.get("usage") if isinstance(d.get("usage"), dict) else {}
         provider = d.get("provider") or _infer_provider(d)
         sidecar = d.get("agentfin") if isinstance(d.get("agentfin"), dict) else {}
@@ -88,8 +101,45 @@ class ProviderAdapter(Adapter):
             "team": sidecar.get("team", ""),
             "metadata": {"response_id": d.get("id")},
         }
+        # Visibility only: reasoning tokens are already inside completion/output
+        # tokens (billed as output); service_tier lets `modifiers:` apply.
+        out_details = (usage.get("completion_tokens_details")
+                       or usage.get("output_tokens_details") or {})
+        if isinstance(out_details, dict) and out_details.get("reasoning_tokens"):
+            event["metadata"]["reasoning_tokens"] = _int(out_details["reasoning_tokens"])
+        tier = usage.get("service_tier") or d.get("service_tier")
+        if isinstance(tier, str) and tier:
+            event["service_tier"] = tier.lower()[:32]
+            event["metadata"]["service_tier"] = event["service_tier"]
         if d.get("id"):
             event["idem_key"] = f"{provider}:{d['id']}"
+        return event
+
+    def _parse_gemini(self, d: dict[str, Any]) -> dict[str, Any] | None:
+        u = d["usageMetadata"]
+        prompt = _int(u.get("promptTokenCount")) + _int(u.get("toolUsePromptTokenCount"))
+        cached = _int(u.get("cachedContentTokenCount"))
+        thoughts = _int(u.get("thoughtsTokenCount"))
+        sidecar = d.get("agentfin") if isinstance(d.get("agentfin"), dict) else {}
+        rid = d.get("responseId") or d.get("id")
+        event: dict[str, Any] = {
+            "ts": (d.get("createTime") or d.get("create_time") or d.get("created")
+                   or d.get("timestamp") or d.get("ts")),
+            "provider": d.get("provider") or "google",
+            "model_raw": d.get("modelVersion") or d.get("model") or "unknown",
+            "input_tokens": max(prompt - cached, 0),
+            "cache_read_tokens": min(cached, prompt) if prompt else cached,
+            "cache_write_tokens": 0,
+            "output_tokens": _int(u.get("candidatesTokenCount")) + thoughts,
+            "task": sidecar.get("task", ""),
+            "agent": sidecar.get("agent", ""),
+            "team": sidecar.get("team", ""),
+            "metadata": {"response_id": rid},
+        }
+        if thoughts:
+            event["metadata"]["reasoning_tokens"] = thoughts
+        if rid:
+            event["idem_key"] = f"{event['provider']}:{rid}"
         return event
 
 

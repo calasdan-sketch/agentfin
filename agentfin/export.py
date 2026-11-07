@@ -1,11 +1,15 @@
 """Export the ledger: FOCUS-aligned CSV for FinOps tools, or raw events.
 
 `focus` writes one row per (UTC day, SKU, task, agent, team) using column
-names from the FinOps Open Cost and Usage Specification (FOCUS,
-https://focus.finops.org). It is *aligned with*, not certified against, the
-spec: agentfin knows token usage and list-price cost, not your invoice IDs,
-billing accounts or negotiated discounts, so those columns are omitted and
-ListCost = EffectiveCost = BilledCost. FOCUS requires BilledCost, so a group
+names from the FinOps Open Cost and Usage Specification (FOCUS v1.4,
+https://focus.finops.org/docs/specification/v1-4/; v1.4 marks the columns
+written here as Mandatory for the Cost and Usage dataset). It is *aligned with*,
+not certified against, the spec: agentfin knows token usage and list-price
+cost, not your invoice IDs, billing accounts or negotiated discounts.
+ListCost = ContractedCost = EffectiveCost = BilledCost; BillingAccountId /
+BillingAccountName come from `config.yaml` (`billing_account_id`,
+`billing_account_name`) and are "unknown" when unset; ChargeClass is empty
+(these are not corrections to an invoiced period). FOCUS requires BilledCost, so a group
 containing unpriced events is written with cost 0 and `x_Unpriced = true`, and
 `agentfin export` prints a warning naming how many rows that affected.
 
@@ -29,8 +33,10 @@ from . import reports
 FOCUS_COLUMNS = [
     "BillingPeriodStart", "BillingPeriodEnd", "ChargePeriodStart", "ChargePeriodEnd",
     "ChargeCategory", "ChargeDescription", "ServiceCategory", "ServiceName",
-    "ProviderName", "PublisherName", "SkuId", "ConsumedQuantity", "ConsumedUnit",
-    "ListCost", "EffectiveCost", "BilledCost", "BillingCurrency", "Tags",
+    "ServiceProviderName", "HostProviderName", "InvoiceIssuerName", "BillingAccountId",
+    "BillingAccountName", "ChargeClass", "ChargeFrequency", "SkuId", "ConsumedQuantity",
+    "ConsumedUnit", "PricingQuantity", "PricingUnit",
+    "ListCost", "ContractedCost", "EffectiveCost", "BilledCost", "BillingCurrency", "Tags",
     "x_InputTokens", "x_CacheReadTokens", "x_CacheWriteTokens", "x_OutputTokens",
     "x_Events", "x_Unpriced",
 ]
@@ -67,7 +73,8 @@ def _iso(d: date) -> str:
 
 
 def focus_rows(
-    conn: sqlite3.Connection, date_from: str | None = None, date_to: str | None = None
+    conn: sqlite3.Connection, date_from: str | None = None, date_to: str | None = None,
+    billing_account_id: str = "", billing_account_name: str = "",
 ) -> Iterator[dict[str, Any]]:
     where, params = reports.time_where(date_from, date_to)
     cur = conn.execute(
@@ -98,12 +105,20 @@ def focus_rows(
             "ChargeDescription": f"{tokens} tokens of {r['model_raw']}",
             "ServiceCategory": "AI and Machine Learning",
             "ServiceName": r["provider"],
-            "ProviderName": r["provider"],
-            "PublisherName": r["provider"],
+            "ServiceProviderName": r["provider"],
+            "HostProviderName": r["provider"],
+            "InvoiceIssuerName": r["provider"],
+            "BillingAccountId": billing_account_id or "unknown",
+            "BillingAccountName": billing_account_name or billing_account_id or "unknown",
+            "ChargeClass": "",
+            "ChargeFrequency": "Usage-Based",
             "SkuId": r["sku"],
             "ConsumedQuantity": tokens,
             "ConsumedUnit": "Tokens",
+            "PricingQuantity": tokens,
+            "PricingUnit": "Tokens",
             "ListCost": _usd(cost),
+            "ContractedCost": _usd(cost),
             "EffectiveCost": _usd(cost),
             "BilledCost": _usd(cost),
             "BillingCurrency": "USD",

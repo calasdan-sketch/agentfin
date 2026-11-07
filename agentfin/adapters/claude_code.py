@@ -87,6 +87,8 @@ class ClaudeCodeAdapter(Adapter):
         if not ts:
             return None
         project = _project_name(d.get("cwd"))
+        raw_tier = usage.get("service_tier")
+        tier = raw_tier.lower()[:32] if isinstance(raw_tier, str) and raw_tier else None
         meta: dict[str, Any] = {
             "source": "claude-code",
             "session_id": d.get("sessionId"),
@@ -94,6 +96,7 @@ class ClaudeCodeAdapter(Adapter):
             "project": project or None,
             "git_branch": d.get("gitBranch"),
             "stop_reason": msg.get("stop_reason"),
+            "service_tier": tier,
             # No stop_reason yet = the response may still be streaming; a later,
             # more complete record revises it via a correction event.
             "partial": not msg.get("stop_reason"),
@@ -104,6 +107,7 @@ class ClaudeCodeAdapter(Adapter):
             "model_raw": str(msg.get("model") or "unknown"),
             **tokens,
             "cache_write_1h_tokens": anthropic_cache_write_1h(usage),
+            "service_tier": tier,
             "task": project,
             "agent": "claude-code-subagent" if d.get("isSidechain") else "claude-code",
             "team": "",

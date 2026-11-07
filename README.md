@@ -7,12 +7,15 @@ SQLite ledger, attributes every event to a task/agent/team via rules,
 prices it from a YAML price book you control, and answers the Monday-morning
 question: *did the $4K spike come from a runaway agent or real work?* It then
 goes past spend tracking to **cost-per-outcome and ROI**, budget forecasts
-that warn *before* an overrun, and an export in FinOps (FOCUS) column format.
+that warn *before* an overrun, **month-end close** (freeze a month, catch late
+or changed data later, write a balanced journal in CAD/USD/any currency you
+give a rate for), showback of shared spend, cost per merged git branch, and an
+export in FinOps (FOCUS 1.4) column format.
 
 ## Install
 
 ```bash
-pip install agentfin            # 0.3.0 features: install from source until released
+pip install agentfin            # 0.4.0 features: install from source until released
 # or from source:
 pip install -e ".[dev]"
 ```
@@ -54,6 +57,7 @@ being dropped as a duplicate.
 ```bash
 agentfin ingest --adapter provider usage.jsonl  # raw Anthropic/OpenAI API responses
 agentfin ingest --adapter gateway gateway.jsonl # calas-gateway ledger lines
+agentfin ingest --adapter otel spans.jsonl      # OpenTelemetry GenAI spans (OTLP JSON lines)
 agentfin ingest --adapter jsonl logs/           # your own shape; dirs and `-` (stdin) work
 agentfin report --by team --from 2026-10-01 --to 2026-10-31   # --to is inclusive
 agentfin anomalies                              # spikes + probable cause
@@ -61,7 +65,14 @@ agentfin budgets set team:platform 500          # create/update a monthly cap
 agentfin budgets check --fail-on-alert          # exit 3 if forecast to overrun (CI/cron)
 agentfin outcomes tag refactor --kind hours_saved --value 4
 agentfin outcomes roi                           # cost-per-outcome per task
-agentfin export --format focus --out focus.csv  # FinOps FOCUS-aligned CSV
+agentfin allocate --from 2026-10-01 --to 2026-10-31   # share `unassigned` spend over teams
+agentfin savings                                # what prompt caching saved vs no cache
+agentfin whatif --swap A=B --by task            # same tokens on another SKU (hypothetical)
+agentfin outcomes git --repo . --base main      # cost per merged branch; spend that never merged
+agentfin close run 2026-10 --tz America/Chicago --fx CAD=1.37   # use your own rate
+agentfin close verify 2026-10                   # exit 3 if late/changed data since the close
+agentfin close journal 2026-10 --currency CAD --out journal.csv
+agentfin export --format focus --out focus.csv  # FinOps FOCUS 1.4 columns
 agentfin export --format csv                    # raw ledger events (also: jsonl)
 agentfin dashboard --out report.html            # static HTML, no server
 agentfin doctor                                 # unpriced SKUs, fuzzy-priced SKUs, gaps
@@ -72,6 +83,33 @@ Exit codes: `0` ok · `1` error · `2` usage error · `3` a `--fail-on-alert` /
 budgets, or an invalid budget entry is an error (1), and unpriced spend inside a
 budget scope trips the gate (3) because its true cost is unknown. The anomaly
 gate ignores the 24h display cooldown, so a CI retry fails again.
+
+## Month-end close (for whoever signs off the books)
+
+```bash
+agentfin close run 2026-10 --tz America/Chicago --fx CAD=1.37
+agentfin close verify 2026-10     # 0 = unchanged, 3 = drifted, 1 = not closed
+agentfin close journal 2026-10 --currency CAD --out journal.csv
+```
+
+`close run` refuses a month that has not ended in your time zone, and refuses
+UNPRICED events unless you pass `--allow-unpriced` (they are then excluded and
+counted). It stores the totals, a SHA-256 digest of every closed event, the
+sha256 of your price book and the FX rates **you** supplied (agentfin never
+fetches a rate). `close verify` then tells you *why* a closed month changed:
+late-arriving events in the month (count and dollars), or closed rows that were
+repriced, edited or deleted. `close journal` refuses to run on a drifted month
+and writes one debit per team (account names from `config.yaml`:
+`gl_accounts`, `gl_expense_default`, `gl_accrual`) and one credit, rounded once
+so debits equal credits to the cent in every currency. A drifted month is fixed
+with `close run --supersede`, which keeps the old close on record. The ledger
+also refuses `DELETE` and any `UPDATE` other than filling an unpriced cost
+(tamper-evident, not tamper-proof: someone with write access to the file can
+drop the guards, which is what the digest catches).
+
+`allocate` splits `unassigned` spend over the named teams in proportion to
+their own direct spend, in exact integer micro-dollars, so loaded team totals
+always sum to the ledger total.
 
 ## How it compares
 
@@ -86,15 +124,38 @@ linked docs did not describe the feature, not that it is impossible.
 | Budgets with month-end forecast alerts | yes, CLI exit code for CI | — | — | budget fields on keys/teams | — |
 | ROI / cost-per-outcome | yes | — | — | — | — |
 | Invoice reconciliation per SKU | yes | — | — | — | — |
-| FOCUS-format export | aligned columns | — | — | — | — |
+| FOCUS-format export | FOCUS 1.4 mandatory Cost-and-Usage columns, aligned not certified | — | — | — | — |
+| Reads OpenTelemetry GenAI spans | yes (`otel` adapter, file input) | — | yes, `gen_ai.usage.*` ([docs](https://langfuse.com/docs/observability/features/token-and-cost-tracking)) | — | — |
+| Month-end close with drift detection and journal | yes | — | — | — | — |
+| Shared-cost (showback) allocation | yes (`allocate`) | — | — | — | — |
+| Cost per merged git branch | yes (`outcomes git`) | — | — | — | — |
 | Unknown model → loud UNPRICED (never $0) | yes | — | no cost calculated | logs a warning + metric | — |
 | Pricing data | your YAML (Anthropic rates checked 2026-11-06) | LiteLLM snapshot | maintained list + custom | maintained cost map | 300+ models |
 | Price changes re-applied to old events | `reprice` fills unpriced only | — | not retroactive | — | — |
+
+Not run, so not in the table: Vantage, CloudZero, Datadog LLM Observability and
+OpenCost (commercial or Kubernetes-focused; their public docs were skimmed, not
+tested, and claims about them here are **unverified**). ccusage 20.0.48 was
+installed and run, but it returned zero rows on agentfin's synthetic transcripts
+(cause not investigated), so there is no head-to-head number against it.
 
 Where competitors are ahead: ccusage covers far more agent CLIs and has
 5-hour billing-block and statusline views; Langfuse/Helicone/LiteLLM capture
 usage live from traffic (agentfin is file-based) and ship web UIs; LiteLLM sits
 in the request path with key/team budget settings, while agentfin only alerts.
+
+## Benchmark (re-run it yourself)
+
+`python benchmarks/bench.py 100000` generates synthetic data from a fixed seed
+(no real usage) and prints:
+
+| measure | result on the development VM (your timings will differ) |
+|---|---|
+| Claude Code transcripts: 2,000 real responses written as 6,555 assistant lines (repeated usage + forked copies) | summing every line gives **3.27x** the true output tokens; agentfin returns exactly the 2,000 responses and 3,005,221 output tokens (seed 20261107) |
+| Ingest 100k events | about 5.6-6.4 s (about 16k events/s); the 0.3.0 code took 5.3 s on the same data, so input sanitizing and the append-only guards cost roughly 10-20% |
+| Re-ingest the same 100k (all duplicates) | about 6 s, ledger unchanged |
+| `report --by task` over 100k events | 0.05 s |
+| `close run` / `close verify` / `close journal` over 100k events | about 0.3 s each |
 
 ## How it works
 
@@ -129,7 +190,8 @@ in the request path with key/team budget settings, while agentfin only alerts.
 | `pricing.yaml` | exact-SKU USD/1M-token rates. Paste from the provider pricing page. |
 | `rules.yaml` | attribution rules, first match wins. |
 | `budgets.yaml` | monthly caps per team/agent with forecast-alert thresholds. |
-| `config.yaml` | display currency + FX (marked `*` as estimates), extra redact keys. |
+| `config.yaml` | display currency + FX (marked `*` as estimates), extra redact keys, FOCUS `billing_account_id` / `billing_account_name`, journal accounts (`gl_accounts`, `gl_expense_default`, `gl_accrual`). |
+| `pricing.yaml` `modifiers:` | optional multipliers by `service_tier` (e.g. `batch: 0.5`). None are shipped: copy them from the provider's pricing page. `doctor` lists events whose tier has no modifier. |
 
 ## Adapters
 
@@ -143,7 +205,22 @@ in the request path with key/team budget settings, while agentfin only alerts.
 - `jsonl` — generic JSONL, flat or nested `usage` blocks, flexible key names.
 - `provider` — raw Anthropic (`msg_…`) / OpenAI (`chatcmpl-…`, `resp_…`) API
   responses. OpenAI's cached tokens are a subset of `prompt_tokens`, so they are
-  split out instead of billed twice (fixed in 0.3.0). Optional `agentfin` sidecar for tags.
+  split out instead of billed twice (fixed in 0.3.0). Google Gemini/Vertex
+  `usageMetadata` is read too (cached tokens split out, `thoughtsTokenCount`
+  added to output, which is how it is billed); a response without any
+  timestamp is reported as malformed, not guessed. Reasoning tokens are noted
+  in metadata only (they are already inside the output count). Optional
+  `agentfin` sidecar for tags.
+- `otel` — OpenTelemetry GenAI spans as OTLP JSON lines or the Python SDK's
+  JSON console format. Cached tokens are split out of `gen_ai.usage.input_tokens`
+  (the semantic conventions say it includes them); if a library reports a total
+  smaller than its cache buckets, the buckets are taken as exclusive and the
+  event is marked. Agent/workflow spans and any span with usage-bearing
+  children are skipped so nothing is counted twice. When the span carries a
+  provider response id the key is the same as the `provider` adapter's, so a
+  trace export and a raw API export of one call do not double-count. Set
+  `agentfin.team` / `agentfin.task` / `agentfin.agent` span attributes for
+  attribution. Prompts and completions are never read.
 - `gateway` — calas-gateway ledger lines (`route: provider/model`);
   gateway-computed `cost_usd` is preserved verbatim, never re-priced.
 
@@ -151,7 +228,8 @@ in the request path with key/team budget settings, while agentfin only alerts.
 
 `init [--force] · ingest [--strict] · report · trends · anomalies
 [--fail-on-anomaly] · alerts · budgets [check [--fail-on-alert] | set] ·
-outcomes [tag|roi] · export · reconcile · reprice · dashboard · doctor`
+outcomes [tag|roi|git] · close [run|verify|journal] · allocate · savings ·
+whatif · export · reconcile · reprice · dashboard · doctor`
 
 `ingest` skips malformed lines and reports each as `file:line: reason`, keeping
 the good ones; `--strict` writes nothing if any line is bad.
@@ -193,14 +271,32 @@ ruff check agentfin/ tests/
   before its response finished (no `stop_reason`) is topped up later by a
   correction event (`<id>#rev:<n>`). Reports count it once; raw exports show
   both rows.
-- **FOCUS export is aligned, not certified.** Column names follow the FOCUS
-  spec; agentfin has no invoice IDs, accounts or discounts, so
-  ListCost = EffectiveCost = BilledCost. Rows containing unpriced events carry
+- **FOCUS export is aligned, not certified.** Column names follow FOCUS 1.4
+  (every column its column library marks Mandatory for Cost and Usage is
+  written, checked 2026-11-07); agentfin has no invoice IDs, accounts or
+  discounts, so ListCost = ContractedCost = EffectiveCost = BilledCost and
+  BillingAccountId is whatever you set in `config.yaml` (else "unknown").
+  0.4.0 replaced the old `ProviderName` / `PublisherName` columns with
+  `ServiceProviderName` / `HostProviderName` / `InvoiceIssuerName`. Rows containing unpriced events carry
   cost 0 with `x_Unpriced=true` (FOCUS requires the column) and a warning.
 - **Tiered prices** (e.g. Haiku 5.5 above 100K prompt tokens) are applied per
   request using input + cache-read + cache-write tokens as the prompt size —
   our reading of the pricing page; reconcile to confirm.
 - **Single-user SQLite.** No auth, no concurrency story beyond one writer.
   Fine for a team cron job; not a multi-tenant SaaS backend.
+- **A close is tamper-evident, not tamper-proof.** The digest proves a closed
+  month changed; it does not stop someone with file access from changing it.
+  Months are cut in the time zone you pass (`--tz`); the default is UTC.
+- **Journal columns are generic.** They resemble common journal-import
+  templates but have not been tested against any accounting package. Amounts
+  are list-price token cost, not a vendor invoice; reconcile before posting.
+- **Git linking sees local branches only.** A squash- or rebase-merged branch
+  counts as unmerged unless you pass `--merged-list`; spend on the base branch
+  or with no recorded branch cannot be tied to a PR.
+- **Showback is proportional.** `allocate` assumes shared spend follows direct
+  spend; it is a policy, not a measurement. `whatif` prices the same tokens on
+  another SKU and says nothing about quality or retries.
+- **OTel input semantics vary by library.** See the `otel` adapter note above;
+  the guess is recorded on the event.
 - **Outcome values are estimates.** `hours_saved × rate` is a model, not a
   bank deposit. ROI ranks tasks; don't put it in a 10-K.

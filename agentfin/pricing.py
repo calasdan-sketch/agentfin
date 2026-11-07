@@ -23,6 +23,13 @@ DEFAULT_PRICING = """\
 #   under https://platform.claude.com/docs/en/models/ on 2026-11-06.
 # OpenAI / Google rates: carried over from agentfin 0.2 — re-check before trusting.
 #
+# Optional `modifiers:` (none shipped) scale a request's cost by its service_tier,
+# e.g. a batch discount. Copy the multiplier from the provider's pricing page:
+#   modifiers:
+#     batch: 0.5
+# Events whose service_tier has no modifier are priced at the base rate and
+# listed by `agentfin doctor`.
+#
 # Lookup order: exact SKU -> `aliases` below -> safe normalization
 # (Anthropic date suffixes, Bedrock/Vertex IDs). Anything else is UNPRICED.
 
@@ -187,9 +194,12 @@ UNPRICED = object()
 class PriceBook(dict):
     """`dict` of SKU -> rates (backward compatible) plus explicit `aliases`."""
 
-    def __init__(self, skus=None, aliases=None):
+    def __init__(self, skus=None, aliases=None, modifiers=None):
         super().__init__(skus or {})
         self.aliases: dict[str, str] = dict(aliases or {})
+        #: Price multipliers keyed by an event's `service_tier` (e.g. a batch
+        #: discount). Always user-supplied: agentfin ships none.
+        self.modifiers: dict[str, float] = dict(modifiers or {})
 
 
 def load_pricing(path: str | Path | None) -> PriceBook:
@@ -205,7 +215,19 @@ def load_pricing(path: str | Path | None) -> PriceBook:
     aliases = data.get("aliases", {}) or {}
     if not isinstance(skus, dict) or not isinstance(aliases, dict):
         raise ValueError(f"{p}: `skus` and `aliases` must be mappings")
-    book = PriceBook(skus, {str(k): str(v) for k, v in aliases.items()})
+    mods = data.get("modifiers", {}) or {}
+    if not isinstance(mods, dict):
+        raise ValueError(f"{p}: `modifiers` must be a mapping of service_tier -> multiplier")
+    clean_mods: dict[str, float] = {}
+    for k, v in mods.items():
+        try:
+            mult = float(v)
+        except (TypeError, ValueError):
+            raise ValueError(f"{p}: modifier {k!r} is not a number: {v!r}") from None
+        if not 0 <= mult <= 10 or mult != mult:
+            raise ValueError(f"{p}: modifier {k!r} must be between 0 and 10, got {v!r}")
+        clean_mods[str(k).lower()] = mult
+    book = PriceBook(skus, {str(k): str(v) for k, v in aliases.items()}, clean_mods)
     # Fail fast on a broken price book instead of rejecting every ingested line.
     probe = {"input_tokens": 1, "cache_read_tokens": 1, "cache_write_tokens": 1,
              "output_tokens": 1}
@@ -335,6 +357,10 @@ def cost_micro_usd(
                        else "cache_write")
         + out * _num(active, "output")
     )
+    tier_name = str(event.get("service_tier") or "").lower()
+    mult = (getattr(pricing, "modifiers", None) or {}).get(tier_name)
+    if mult is not None:
+        total *= mult
     return int(round(total))
 
 

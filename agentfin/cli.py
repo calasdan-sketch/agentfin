@@ -19,16 +19,26 @@ from . import (
     budgets,
     dashboard,
     export,
+    gitlink,
     ledger,
     outcomes,
     pricing,
     reconcile,
     reports,
+    textsafe,
+    whatif,
+)
+from . import (
+    allocate as allocate_mod,
+)
+from . import (
+    close as close_mod,
 )
 from .adapters.base import IngestContext
 from .adapters.claude_code import ClaudeCodeAdapter, default_roots
 from .adapters.gateway import GatewayAdapter
 from .adapters.jsonl import JsonlAdapter
+from .adapters.otel import OtelAdapter
 from .adapters.provider import ProviderAdapter
 
 ADAPTERS = {
@@ -36,6 +46,7 @@ ADAPTERS = {
     "jsonl": JsonlAdapter(),
     "provider": ProviderAdapter(),
     "gateway": GatewayAdapter(),
+    "otel": OtelAdapter(),
 }
 
 DEFAULT_DB = "agentfin.db"
@@ -70,7 +81,7 @@ def _fx_convert(micro, currency, fx_rates) -> tuple[str, bool]:
         return "UNPRICED", False
     usd = micro / 1_000_000
     if not currency or currency.upper() == "USD":
-        return f"${usd:,.2f}", False
+        return (f"-${-usd:,.2f}" if usd < 0 else f"${usd:,.2f}"), False
     rate = (fx_rates or {}).get(currency.upper())
     if not rate:
         return f"${usd:,.2f} USD (no FX rate for {currency})", False
@@ -190,7 +201,7 @@ def ingest(ctx, files, adapter, no_redact, strict):
     skipped = 0
 
     def fail(where: str, exc: Exception) -> None:
-        errors.append(f"{where}: {type(exc).__name__}: {exc}"[:300])
+        errors.append(textsafe.clean(f"{where}: {type(exc).__name__}: {exc}", 300))
         if strict:
             conn.rollback()
             conn.close()
@@ -219,29 +230,35 @@ def ingest(ctx, files, adapter, no_redact, strict):
                     d = json.loads(line)
                     if not isinstance(d, dict):
                         raise ValueError(f"expected a JSON object, got {type(d).__name__}")
-                    event = parser.parse_record(d)
+                    found = parser.parse_records(d)
                 except (ValueError, TypeError, KeyError, AttributeError,
                         OverflowError, RecursionError) as exc:
                     fail(where, exc)
                     continue
-                if event is None:
+                if not found:
                     skipped += 1
-                elif parser.buffered:
-                    event["_where"] = where
-                    key = event.get("idem_key")
-                    if not key:
-                        unkeyed.append(event)
-                    elif key not in pending or parser.prefer(event, pending[key]):
-                        pending[key] = event
-                else:
-                    emit(where, event)
+                for event in found:
+                    if parser.buffered:
+                        event["_where"] = where
+                        key = event.get("idem_key")
+                        if not key:
+                            unkeyed.append(event)
+                        elif key not in pending or parser.prefer(event, pending[key]):
+                            pending[key] = event
+                    else:
+                        emit(where, event)
         finally:
             if src == "-":
                 fh.detach()  # leave the process's stdin open
             else:
                 fh.close()
-    for event in [*pending.values(), *unkeyed]:
+    batch = parser.post_reduce([*pending.values(), *unkeyed]) if parser.buffered else []
+    for event in batch:
         emit(event.pop("_where", "?"), event)
+    aggregates = getattr(parser, "skipped_aggregates", 0)
+    if aggregates:
+        skipped += aggregates
+        parser.skipped_aggregates = 0
     ictx.commit()
     conn.close()
     click.echo(
@@ -303,7 +320,7 @@ def report(ctx, by, date_from, date_to, as_json):
     for r in rows:
         note = "UNPRICED events!" if r["unpriced_events"] else ""
         click.echo(
-            f"{str(r['dim']):<28}{_money(ctx, r['cost_micro_usd']):>14}"
+            f"{textsafe.clean(r['dim'], 27):<28}{_money(ctx, r['cost_micro_usd']):>14}"
             f"{r['events']:>10}  {note}"
         )
 
@@ -370,7 +387,7 @@ def alerts_cmd(ctx, dismiss):
     else:
         for a in anomalies.list_alerts(conn):
             flag = "dismissed" if a["dismissed"] else "ACTIVE"
-            click.echo(f"[{flag}] {a['alert_key']} fired {a['fired_at']}")
+            click.echo(f"[{flag}] {textsafe.clean(a['alert_key'])} fired {a['fired_at']}")
     conn.close()
 
 
@@ -601,8 +618,14 @@ def export_cmd(ctx, fmt, out, date_from, date_to):
                 for row in rows:
                     unpriced_rows += row["x_Unpriced"] == "true"
                     yield row
-            n = export.write_csv(counted(export.focus_rows(conn, date_from, date_to)),
-                                 export.FOCUS_COLUMNS, fh)
+            cfg = ctx.obj["config"]
+            n = export.write_csv(
+                counted(export.focus_rows(
+                    conn, date_from, date_to,
+                    billing_account_id=textsafe.clean(cfg.get("billing_account_id") or ""),
+                    billing_account_name=textsafe.clean(cfg.get("billing_account_name") or ""),
+                )),
+                export.FOCUS_COLUMNS, fh)
         elif fmt == "csv":
             n = export.write_csv(export.event_rows(conn, date_from, date_to),
                                  export.EVENT_COLUMNS, fh)
@@ -642,9 +665,9 @@ def reprice(ctx):
     for r in rows:
         ev = dict(r)
         try:
-            ev["cache_write_1h_tokens"] = int(
-                json.loads(r["metadata_json"] or "{}").get("cache_write_1h_tokens") or 0
-            )
+            meta = json.loads(r["metadata_json"] or "{}")
+            ev["cache_write_1h_tokens"] = int(meta.get("cache_write_1h_tokens") or 0)
+            ev["service_tier"] = meta.get("service_tier")
         except (ValueError, TypeError, AttributeError):
             pass
         cost = pricing.cost_micro_usd(r["sku"], rates, ev)
@@ -678,7 +701,7 @@ def doctor(ctx):
     click.echo(f"events: {tot['events']:,}  span: {span['mn']} → {span['mx']}")
     click.echo(f"unpriced events: {tot['unpriced_events'] or 0:,}")
     for r in unpriced:
-        click.echo(f"  · {r['sku']}: {r['c']:,} events (add to pricing.yaml)")
+        click.echo(f"  · {textsafe.clean(r['sku'])}: {r['c']:,} events (add to pricing.yaml)")
     click.echo(f"unattributed (team=unassigned): {unattributed:,}")
     try:
         fuzzy = conn.execute(
@@ -692,7 +715,27 @@ def doctor(ctx):
     if fuzzy:
         click.echo("priced via normalization/alias (check these are right):")
         for r in fuzzy:
-            click.echo(f"  · {r['sku']} → {r['priced_as']}: {r['c']:,} events")
+            click.echo(f"  · {textsafe.clean(r['sku'])} → "
+                       f"{textsafe.clean(r['priced_as'])}: {r['c']:,} events")
+    try:
+        tiers = conn.execute(
+            """SELECT json_extract(metadata_json, '$.service_tier') AS tier, COUNT(*) c
+               FROM usage_events WHERE json_extract(metadata_json, '$.service_tier')
+               IS NOT NULL GROUP BY tier"""
+        ).fetchall()
+    except sqlite3.OperationalError:
+        tiers = []
+    try:
+        mods = pricing.load_pricing(ctx.obj["paths"]["pricing"]).modifiers
+    except (ValueError, yaml.YAMLError):
+        mods = {}
+    for r in tiers:
+        if r["tier"] not in ("standard", "default", "auto") and r["tier"] not in mods:
+            click.echo(
+                f"⚠ {r['c']:,} events used service tier {textsafe.clean(r['tier'], 32)!r} with no "
+                "`modifiers:` entry in pricing.yaml: priced at the base rate "
+                "(batch/flex/priority prices differ; add the multiplier from the provider's "
+                "pricing page, then re-ingest into a fresh ledger)")
     # Cross-source double-ingest heuristic: identical token/timestamp/SKU
     # rows under different idempotency keys (e.g. gateway file + provider
     # export covering the same calls) would double-count spend.
@@ -713,3 +756,251 @@ def doctor(ctx):
     if tot["unpriced_events"]:
         click.echo("tip: add the SKUs to pricing.yaml, then run `agentfin reprice` "
                    "to fill NULL costs from the new rates.")
+
+
+# ---------------------------------------------------------------------------
+# Month-end close, showback, savings, git outcomes
+# ---------------------------------------------------------------------------
+
+
+def _fail(exc: Exception):
+    raise click.ClickException(textsafe.clean(exc, 400)) from None
+
+
+@main.group("close")
+def close_grp():
+    """Month-end close: freeze a month, detect later drift, write a journal."""
+
+
+@close_grp.command("run")
+@click.argument("month")
+@click.option("--tz", default="UTC", show_default=True,
+              help="IANA time zone that defines the month, e.g. America/Chicago")
+@click.option("--fx", "fx_pairs", multiple=True,
+              help="FX rate to record, units per 1 USD, e.g. --fx CAD=1.37 (repeatable)")
+@click.option("--allow-unpriced", is_flag=True,
+              help="close even though some events have no price (they are excluded)")
+@click.option("--supersede", is_flag=True, help="record a new version of an existing close")
+@click.option("--note", default="")
+@click.pass_context
+def close_run_cmd(ctx, month, tz, fx_pairs, allow_unpriced, supersede, note):
+    """Close MONTH (YYYY-MM): store totals, a digest and the FX rates you give."""
+    _require_db(ctx)
+    conn = ledger.connect(ctx.obj["paths"]["db"])
+    try:
+        rec = close_mod.run_close(
+            conn, month, tz, close_mod.parse_fx(fx_pairs), ctx.obj["paths"]["pricing"],
+            allow_unpriced, note, supersede)
+    except close_mod.CloseError as exc:
+        conn.close()
+        _fail(exc)
+    conn.close()
+    click.echo(
+        f"closed {rec['month']} v{rec['version']} ({rec['tz']}): {rec['events']:,} rows, "
+        f"{pricing.format_usd(rec['cost_micro_usd'])} USD, digest {rec['digest'][:16]}"
+        + (f", {rec['unpriced_events']} unpriced excluded" if rec["unpriced_events"] else ""))
+
+
+@close_grp.command("verify")
+@click.argument("month")
+@click.pass_context
+def close_verify_cmd(ctx, month):
+    """Check a closed month still matches the ledger (exit 3 if it drifted)."""
+    _require_db(ctx)
+    conn = ledger.connect(ctx.obj["paths"]["db"])
+    try:
+        v = close_mod.verify(conn, month)
+    except close_mod.CloseError as exc:
+        conn.close()
+        _fail(exc)
+    conn.close()
+    if v["ok"]:
+        click.echo(f"{month} v{v['version']}: OK - matches the close of {v['closed_at']}")
+        return
+    click.echo(f"{month} v{v['version']}: DRIFT since the close of {v['closed_at']}")
+    if v["late_events"]:
+        click.echo(f"  {v['late_events']} late event(s) in the month, "
+                   f"{pricing.format_usd(v['late_cost_micro_usd'])} USD"
+                   + (f" ({v['late_unpriced']} unpriced)" if v["late_unpriced"] else ""))
+    if v["altered"]:
+        click.echo(f"  closed rows changed: {v['rows_at_close']} at close, "
+                   f"{v['rows_now']} now; cost {pricing.format_usd(v['closed_cost_micro_usd'])} -> "
+                   f"{pricing.format_usd(v['cost_now_micro_usd'])} (repriced, edited or deleted)")
+    click.echo(f"  fix: agentfin close run {month} --supersede")
+    ctx.exit(ALERT_EXIT_CODE)
+
+
+@close_grp.command("journal")
+@click.argument("month")
+@click.option("--currency", default="USD", show_default=True,
+              help="amounts in this currency, using the FX rate recorded at close")
+@click.option("--out", default="-", show_default=True)
+@click.pass_context
+def close_journal_cmd(ctx, month, currency, out):
+    """Write a balanced journal CSV (debit per team, credit to accrual).
+
+    Account names come from config.yaml: gl_accounts (team -> account),
+    gl_expense_default, gl_accrual. Column names resemble common journal-import
+    templates but have not been tested against any accounting package."""
+    _require_db(ctx)
+    conn = ledger.connect(ctx.obj["paths"]["db"])
+    try:
+        rows = close_mod.journal_rows(conn, month, ctx.obj["config"], currency)
+    except (close_mod.CloseError, ValueError) as exc:
+        conn.close()
+        _fail(exc)
+    conn.close()
+    fh = sys.stdout if out == "-" else open(out, "w", encoding="utf-8", newline="")
+    try:
+        close_mod.write_journal(rows, fh)
+    finally:
+        if out != "-":
+            fh.close()
+    if out != "-":
+        click.echo(f"wrote {len(rows)} journal lines to {out}")
+
+
+@main.command("allocate")
+@click.option("--by", "by", type=click.Choice(sorted(reports.DIMENSIONS)), default="team",
+              show_default=True)
+@click.option("--pool", default="unassigned", show_default=True,
+              help="the value whose spend is shared out (e.g. unassigned)")
+@click.option("--from", "date_from", default=None)
+@click.option("--to", "date_to", default=None)
+@click.option("--json", "as_json", is_flag=True)
+@click.pass_context
+def allocate_cmd(ctx, by, pool, date_from, date_to, as_json):
+    """Showback: share unattributed spend across teams in proportion to their own."""
+    _require_db(ctx)
+    conn = ledger.connect(ctx.obj["paths"]["db"])
+    try:
+        res = allocate_mod.allocate(conn, date_from, date_to, pool, by)
+    except ValueError as exc:
+        conn.close()
+        _fail(exc)
+    conn.close()
+    if as_json:
+        click.echo(json.dumps(res, indent=2))
+        return
+    click.echo(f"{by:<24}{'direct':>12}{'shared':>12}{'loaded':>12}")
+    click.echo("-" * 60)
+    for r in res["rows"]:
+        click.echo(f"{textsafe.clean(r[by], 23):<24}{_money(ctx, r['direct_micro_usd']):>12}"
+                   f"{_money(ctx, r['allocated_micro_usd']):>12}"
+                   f"{_money(ctx, r['loaded_micro_usd']):>12}")
+    click.echo(f"{'total':<24}{'':>12}{_money(ctx, res['pool_micro_usd']):>12}"
+               f"{_money(ctx, res['total_micro_usd']):>12}   (shared pool: {pool})")
+    if res["unpriced_events"]:
+        click.echo(f"⚠ {res['unpriced_events']} UNPRICED events are not in these totals", err=True)
+
+
+@main.command("savings")
+@click.option("--by", "by", type=click.Choice(sorted(reports.DIMENSIONS)), default="sku",
+              show_default=True)
+@click.option("--from", "date_from", default=None)
+@click.option("--to", "date_to", default=None)
+@click.pass_context
+def savings_cmd(ctx, by, date_from, date_to):
+    """What prompt caching saved: actual cost vs the same tokens without a cache."""
+    _require_db(ctx)
+    book = pricing.load_pricing(ctx.obj["paths"]["pricing"])
+    conn = ledger.connect(ctx.obj["paths"]["db"])
+    try:
+        res = whatif.cache_savings(conn, book, date_from, date_to, by)
+    except ValueError as exc:
+        conn.close()
+        _fail(exc)
+    conn.close()
+    click.echo(f"{by:<28}{'actual':>12}{'no cache':>12}{'saved':>12}")
+    click.echo("-" * 64)
+    for r in res["rows"]:
+        click.echo(f"{textsafe.clean(r[by], 27):<28}{_money(ctx, r['actual_micro_usd']):>12}"
+                   f"{_money(ctx, r['without_cache_micro_usd']):>12}"
+                   f"{_money(ctx, r['saved_micro_usd']):>12}")
+    if res["skipped_events"]:
+        click.echo(f"({res['skipped_events']} unpriced events left out)", err=True)
+
+
+@main.command("whatif")
+@click.option("--swap", "swaps", multiple=True, required=True,
+              help="SKU=SKU, e.g. anthropic:claude-opus-5=anthropic:claude-sonnet-5")
+@click.option("--by", "by", type=click.Choice(sorted(reports.DIMENSIONS)), default="task",
+              show_default=True)
+@click.option("--from", "date_from", default=None)
+@click.option("--to", "date_to", default=None)
+@click.pass_context
+def whatif_cmd(ctx, swaps, by, date_from, date_to):
+    """Price the same tokens on another SKU (a comparison, not a forecast)."""
+    _require_db(ctx)
+    mapping = {}
+    for sw in swaps:
+        a, sep, b = sw.partition("=")
+        if not sep or not a or not b:
+            raise click.BadParameter(f"{sw!r}: use FROM_SKU=TO_SKU", param_hint="--swap")
+        mapping[a] = b
+    book = pricing.load_pricing(ctx.obj["paths"]["pricing"])
+    unknown = [b for b in mapping.values() if pricing.resolve(b, book)[1] is None]
+    if unknown:
+        raise click.ClickException(f"no price for {', '.join(unknown)} in pricing.yaml")
+    conn = ledger.connect(ctx.obj["paths"]["db"])
+    try:
+        res = whatif.model_swap(conn, book, mapping, date_from, date_to, by)
+    except ValueError as exc:
+        conn.close()
+        _fail(exc)
+    conn.close()
+    click.echo("HYPOTHETICAL: same tokens, other SKU's list prices. Quality, retries and token "
+               "counts would differ.")
+    click.echo(f"{by:<28}{'actual':>12}{'swapped':>12}{'delta':>12}")
+    click.echo("-" * 64)
+    for r in res["rows"]:
+        click.echo(f"{textsafe.clean(r[by], 27):<28}{_money(ctx, r['actual_micro_usd']):>12}"
+                   f"{_money(ctx, r['swapped_micro_usd']):>12}"
+                   f"{_money(ctx, r['delta_micro_usd']):>12}")
+    if res["skipped_events"]:
+        click.echo(f"({res['skipped_events']} unpriced events left out)", err=True)
+
+
+@outcomes_grp.command("git")
+@click.option("--repo", default=".", show_default=True,
+              type=click.Path(exists=True, file_okay=False))
+@click.option("--base", default=None, help="base branch (default: main/master/trunk/develop)")
+@click.option("--merged-list", type=click.Path(exists=True, dir_okay=False), default=None,
+              help="file of merged branch names, one per line (e.g. from `gh pr list`)")
+@click.option("--project", default=None, help="only events from this project (cwd folder name)")
+@click.option("--from", "date_from", default=None)
+@click.option("--to", "date_to", default=None)
+@click.pass_context
+def outcomes_git_cmd(ctx, repo, base, merged_list, project, date_from, date_to):
+    """Cost per merged branch, and spend on branches that never merged."""
+    _require_db(ctx)
+    extra = None
+    if merged_list:
+        extra = {textsafe.clean(line) for line in
+                 Path(merged_list).read_text(encoding="utf-8", errors="replace").splitlines()
+                 if line.strip() and not line.startswith("#")}
+    conn = ledger.connect(ctx.obj["paths"]["db"])
+    try:
+        res = gitlink.analyze(conn, repo, base, extra, date_from, date_to, project)
+    except (gitlink.GitError, ValueError) as exc:
+        conn.close()
+        _fail(exc)
+    conn.close()
+    click.echo(f"{'branch':<40}{'status':<10}{'cost':>12}{'commits':>9}{'lines':>8}")
+    click.echo("-" * 79)
+    for r in res["rows"]:
+        click.echo(f"{r['branch'][:39]:<40}{r['status']:<10}"
+                   f"{_money(ctx, r['cost_micro_usd']):>12}"
+                   f"{'' if r['commits'] is None else r['commits']:>9}"
+                   f"{'' if r['lines_changed'] is None else r['lines_changed']:>8}")
+    click.echo("-" * 79)
+    per = res["cost_per_merged_branch_micro_usd"]
+    click.echo(f"merged: {res['merged_branches']} branches, "
+               f"{_money(ctx, res['merged_cost_micro_usd'])}"
+               + (f" ({_money(ctx, per)} per merged branch)" if per is not None else ""))
+    click.echo(f"never merged: {res['unmerged_branches']} branches, "
+               f"{_money(ctx, res['unmerged_cost_micro_usd'])}")
+    click.echo(f"on {res['base']} or no branch recorded (cannot be linked): "
+               f"{_money(ctx, res['base_cost_micro_usd'] + res['unlinked_cost_micro_usd'])}")
+    if res["unpriced_events"]:
+        click.echo(f"⚠ {res['unpriced_events']} UNPRICED events are not in these costs", err=True)

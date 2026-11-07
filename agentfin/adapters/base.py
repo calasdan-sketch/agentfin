@@ -7,7 +7,7 @@ import sqlite3
 from collections.abc import Iterable
 from typing import Any
 
-from .. import attribution, ledger, pricing, redact
+from .. import attribution, ledger, pricing, redact, textsafe
 
 
 class IngestContext:
@@ -31,6 +31,8 @@ class IngestContext:
 
     def emit(self, raw: dict[str, Any]) -> None:
         event = dict(raw)
+        event["provider"] = textsafe.clean(event["provider"])
+        event["model_raw"] = textsafe.clean(event["model_raw"])
         event.setdefault("idem_key", ledger.idem_key_for(event))
         meta = event.get("metadata") or {}
         if not self.no_redact:
@@ -171,13 +173,20 @@ class Adapter:
         """Turn one decoded JSON object into a canonical event (or None to skip)."""
         raise NotImplementedError
 
+    def parse_records(self, d: dict[str, Any]) -> list[dict[str, Any]]:
+        """One decoded JSON object -> zero or more canonical events. Adapters whose
+        input lines can hold several events (e.g. OTLP span batches) override this."""
+        event = self.parse_record(d)
+        return [] if event is None else [event]
+
+    def post_reduce(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Hook for buffered adapters: final pass over the de-duplicated batch."""
+        return events
+
     def parse(self, lines: Iterable[str]) -> Iterable[dict[str, Any]]:
         """Yield canonical event dicts from raw input lines (strict: raises on bad lines)."""
-        events = (self.parse_record(d) for d in iter_json_lines(lines))
-        events = [e for e in events if e is not None] if self.buffered else (
-            e for e in events if e is not None
-        )
-        return self.reduce(events) if self.buffered else events
+        events = (e for d in iter_json_lines(lines) for e in self.parse_records(d))
+        return self.post_reduce(self.reduce(list(events))) if self.buffered else events
 
     def prefer(self, new: dict[str, Any], current: dict[str, Any]) -> bool:
         """For buffered adapters: should `new` replace `current` (same idem key)?"""
