@@ -1,5 +1,5 @@
 include LICENSE README.md CHANGELOG.md PUBLISH-CHECKLIST.md
-recursive-include tests *.py
+recursive-include tests *.py *.json *.csv *.jsonl *.html *.txt *.yaml *.sqlite3
 recursive-include examples *.jsonl *.py
 recursive-include benchmarks *.py
 recursive-include docs *.md

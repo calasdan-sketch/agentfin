@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from decimal import ROUND_HALF_EVEN, Decimal
+from decimal import ROUND_FLOOR, ROUND_HALF_EVEN, Decimal
 
 
 def apportion(total: int, weights: dict[str, int]) -> dict[str, int]:
@@ -30,11 +30,20 @@ def micro_to_cents(micro: int, rate: Decimal) -> Decimal:
 
 def convert_parts(micro_by_key: dict[str, int], rate: Decimal) -> dict[str, Decimal]:
     """Convert per-key micro-USD to a currency in whole cents so the converted
-    parts sum exactly to the converted total (rounded once, half-even)."""
+    parts sum exactly to the converted total (rounded once, half-even).
+
+    Each key keeps (to within one cent) its OWN converted amount, including when a
+    key is negative (net corrections): parts are floored to the cent and the few
+    cents of residue go to the largest fractional remainders, ties by key."""
+    keys = sorted(micro_by_key)
     total_cents = int((micro_to_cents(sum(micro_by_key.values()), rate) * 100)
                       .quantize(Decimal(1), rounding=ROUND_HALF_EVEN))
-    weights = {k: abs(v) for k, v in micro_by_key.items()}
-    if not any(weights.values()):
-        return {k: Decimal(0) for k in micro_by_key}
-    cents = apportion(total_cents, weights)
-    return {k: Decimal(v) / 100 for k, v in cents.items()}
+    exact = {k: micro_to_cents(micro_by_key[k], rate) * 100 for k in keys}
+    floors = {k: int(exact[k].to_integral_value(rounding=ROUND_FLOOR)) for k in keys}
+    residue = total_cents - sum(floors.values())
+    order = sorted(keys, key=lambda k: (-(exact[k] - floors[k]), k))
+    if residue < 0 or residue > len(keys):  # cannot happen: |total error| < len(keys) cents
+        raise ValueError("internal rounding error in currency conversion")
+    for k in order[:residue]:
+        floors[k] += 1
+    return {k: Decimal(floors[k]) / 100 for k in micro_by_key}

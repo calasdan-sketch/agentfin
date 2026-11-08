@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import calendar
 import json
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,12 +45,20 @@ def save_budgets(path: str | Path, blist: list[dict[str, Any]]) -> None:
     """
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(
+    text = (
         "# agentfin budgets — monthly caps in USD.\n"
         "# alert_at: fraction of *forecasted* month-end spend that triggers an alert.\n"
-        + yaml.safe_dump({"budgets": blist}, sort_keys=False, allow_unicode=True),
-        encoding="utf-8",
+        + yaml.safe_dump({"budgets": blist}, sort_keys=False, allow_unicode=True)
     )
+    # Write a temp file next to the target, then swap it in: a crash or full disk
+    # mid-write leaves the old budgets.yaml intact instead of a half-written gate.
+    tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, p)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
 
 
 def _month_bounds(now: datetime) -> tuple[str, str, int, int]:

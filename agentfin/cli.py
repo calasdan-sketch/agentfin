@@ -5,15 +5,18 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import click
 import yaml
 
 from . import (
+    __author__,
     __version__,
     anomalies,
     attribution,
@@ -143,7 +146,8 @@ class _FriendlyGroup(click.Group):
 
 
 @click.group(cls=_FriendlyGroup)
-@click.version_option(__version__, prog_name="agentfin")
+@click.version_option(__version__, prog_name="agentfin",
+                      message=f"%(prog)s, version %(version)s ({__author__})")
 @click.option("--db", default=None, help="SQLite db path")
 @click.option("--config-dir", default=None, help="Config dir (pricing/rules/budgets)")
 @click.pass_context
@@ -163,12 +167,16 @@ def main(ctx, db, config_dir):
 
 
 @main.command()
-@click.option("--config-dir", default=str(DEFAULT_DIR))
+@click.option("--config-dir", default=None,
+              help="where to scaffold (also accepted before the command: "
+                   "`agentfin --config-dir X init`)")
 @click.option("--force", is_flag=True,
               help="overwrite existing config files (default: refuse)")
-def init(config_dir, force):
+@click.pass_context
+def init(ctx, config_dir, force):
     """Scaffold config files and an empty ledger."""
-    cfg = Path(config_dir)
+    # `agentfin --config-dir X init` used to be ignored (it scaffolded ./.agentfin).
+    cfg = Path(config_dir) if config_dir else ctx.obj["paths"]["pricing"].parent
     cfg.mkdir(parents=True, exist_ok=True)
     files = {
         "pricing.yaml": pricing.DEFAULT_PRICING,
@@ -188,7 +196,8 @@ def init(config_dir, force):
         )
     for name, content in files.items():
         (cfg / name).write_text(content, encoding="utf-8")
-    conn = ledger.connect(cfg / DEFAULT_DB)
+    global_db = ctx.parent.params.get("db") if ctx.parent else None
+    conn = ledger.connect(global_db or cfg / DEFAULT_DB)
     conn.close()
     click.echo(f"initialized agentfin in {cfg}")
 
@@ -267,7 +276,26 @@ def demo():
                "to read your own Claude Code usage.")
 
 
-def _expand_inputs(files, adapter) -> list[str]:
+def _parse_age(ctx, param, value):
+    """click callback: '90m', '6h', '2d' -> seconds (None when not given)."""
+    if value is None:
+        return None
+    m = re.fullmatch(r"\s*(\d{1,6})\s*([mhd])\s*", value.lower())
+    if not m or int(m.group(1)) == 0:
+        raise click.BadParameter("use a number and m, h or d, e.g. 90m, 6h or 2d")
+    return int(m.group(1)) * {"m": 60, "h": 3600, "d": 86400}[m.group(2)]
+
+
+def _fresh_enough(path: str, max_age_s) -> bool:
+    if max_age_s is None:
+        return True
+    try:
+        return time.time() - os.path.getmtime(path) <= max_age_s
+    except OSError:
+        return False
+
+
+def _expand_inputs(files, adapter, max_age_s=None) -> list[str]:
     """Files as given; directories expand to their *.jsonl files (sorted, no
     symlinked-directory traversal); `-` is stdin. With no inputs, the
     claude-code adapter discovers Claude Code's transcript folders itself."""
@@ -289,6 +317,7 @@ def _expand_inputs(files, adapter) -> list[str]:
                 dirs.sort()
                 found.extend(
                     os.path.join(root, n) for n in sorted(names) if n.endswith(".jsonl")
+                    and _fresh_enough(os.path.join(root, n), max_age_s)
                 )
             out.extend(found)
         elif f != "-" and not os.path.isfile(f):
@@ -310,8 +339,12 @@ def _expand_inputs(files, adapter) -> list[str]:
 @click.option("--strict", is_flag=True,
               help="abort and write nothing if any line is malformed (default: skip "
                    "bad lines, report them with file:line, keep the good ones)")
+@click.option("--modified-within", "max_age_s", default=None, callback=_parse_age,
+              metavar="AGE",
+              help="in folders, read only files changed in the last AGE (90m, 6h, 2d): "
+                   "a fast re-run for a scheduled job or hook. Files you name are always read.")
 @click.pass_context
-def ingest(ctx, files, adapter, no_redact, dry_run, strict):
+def ingest(ctx, files, adapter, no_redact, dry_run, strict, max_age_s):
     """Ingest usage records into the ledger.
 
     FILES may be JSONL files, directories (all *.jsonl inside), or `-` for
@@ -320,7 +353,10 @@ def ingest(ctx, files, adapter, no_redact, dry_run, strict):
     """
     paths = ctx.obj["paths"]
     config = ctx.obj["config"]
-    sources = _expand_inputs(files, adapter)
+    sources = _expand_inputs(files, adapter, max_age_s)
+    if adapter != "gateway" and not Path(paths["pricing"]).is_file():
+        click.echo(f"⚠ no price book at {paths['pricing']}: every event will be UNPRICED. "
+                   "Run `agentfin init` (with the same --config-dir) first.", err=True)
     try:
         price_book = pricing.load_pricing(paths["pricing"])
     except (ValueError, yaml.YAMLError) as exc:
@@ -532,8 +568,9 @@ def trends(ctx, dimension, value, days):
 @click.option("--days", default=45, type=int)
 @click.option("--fail-on-anomaly", is_flag=True,
               help=f"exit with status {ALERT_EXIT_CODE} if any anomaly is found (CI/cron gate)")
+@click.option("--json", "as_json", is_flag=True, help="machine-readable output")
 @click.pass_context
-def detect_anomalies(ctx, dimension, days, fail_on_anomaly):
+def detect_anomalies(ctx, dimension, days, fail_on_anomaly, as_json):
     """Detect spend anomalies with probable cause."""
     if fail_on_anomaly:
         _require_db(ctx)
@@ -542,6 +579,11 @@ def detect_anomalies(ctx, dimension, days, fail_on_anomaly):
     alerts = anomalies.detect(conn, dimension=dimension, days=days,
                               respect_cooldown=not fail_on_anomaly)
     conn.close()
+    if as_json:
+        click.echo(json.dumps(alerts, indent=2, default=str))
+        if alerts and fail_on_anomaly:
+            ctx.exit(ALERT_EXIT_CODE)
+        return
     if not alerts:
         click.echo("no anomalies detected")
         return
@@ -578,6 +620,12 @@ def budgets_grp(ctx):
     """Budget management. Bare `budgets` shows status (same as `budgets check`)."""
     if ctx.invoked_subcommand is None:
         _budgets_check(ctx)
+
+
+def _budget_cap(usd) -> str:
+    """$500 for whole dollars, $0.20 for small caps (never a misleading "$0")."""
+    usd = float(usd)
+    return f"${usd:,.0f}" if usd == int(usd) else f"${usd:,.2f}"
 
 
 def _budgets_check(ctx, fail_on_alert=False, as_json=False):
@@ -619,7 +667,7 @@ def _budgets_check(ctx, fail_on_alert=False, as_json=False):
                     if r.get("unpriced_events") else "")
         click.echo(
             f"{r['scope']}: spent {_money(ctx, r['spent_micro_usd'])} / "
-            f"${r['monthly_usd']:,.0f} budget · forecast "
+            f"{_budget_cap(r['monthly_usd'])} budget · forecast "
             f"{_money(ctx, r['forecast_micro_usd'])} "
             f"({r['forecast_pct_of_budget']}%){lowconf} {status}{unpriced}"
         )
@@ -901,11 +949,8 @@ def reprice(ctx):
     click.echo(f"repriced {fixed} of {len(rows)} unpriced events")
 
 
-@main.command()
-@click.pass_context
-def doctor(ctx):
-    """Sanity checks: unpriced SKUs, unattributed events, data coverage."""
-    conn = _open(ctx)
+def _doctor_data(ctx, conn) -> dict:
+    """Everything `doctor` checks, as plain data (text and --json both render this)."""
     tot = reports.totals(conn)
     unpriced = conn.execute(
         "SELECT sku, COUNT(*) c FROM usage_events WHERE cost_micro_usd IS NULL "
@@ -917,11 +962,6 @@ def doctor(ctx):
     span = conn.execute(
         "SELECT MIN(ts_utc) mn, MAX(ts_utc) mx FROM usage_events"
     ).fetchone()
-    click.echo(f"events: {tot['events']:,}  span: {span['mn']} → {span['mx']}")
-    click.echo(f"unpriced events: {tot['unpriced_events'] or 0:,}")
-    for r in unpriced:
-        click.echo(f"  · {textsafe.clean(r['sku'])}: {r['c']:,} events (add to pricing.yaml)")
-    click.echo(f"unattributed (team=unassigned): {unattributed:,}")
     try:
         fuzzy = conn.execute(
             """SELECT sku, json_extract(metadata_json, '$.priced_as') AS priced_as,
@@ -931,11 +971,6 @@ def doctor(ctx):
         ).fetchall()
     except sqlite3.OperationalError:  # SQLite built without JSON1
         fuzzy = []
-    if fuzzy:
-        click.echo("priced via normalization/alias (check these are right):")
-        for r in fuzzy:
-            click.echo(f"  · {textsafe.clean(r['sku'])} → "
-                       f"{textsafe.clean(r['priced_as'])}: {r['c']:,} events")
     try:
         tiers = conn.execute(
             """SELECT json_extract(metadata_json, '$.service_tier') AS tier, COUNT(*) c
@@ -948,13 +983,10 @@ def doctor(ctx):
         mods = pricing.load_pricing(ctx.obj["paths"]["pricing"]).modifiers
     except (ValueError, yaml.YAMLError):
         mods = {}
-    for r in tiers:
-        if r["tier"] not in ("standard", "default", "auto") and r["tier"] not in mods:
-            click.echo(
-                f"⚠ {r['c']:,} events used service tier {textsafe.clean(r['tier'], 32)!r} with no "
-                "`modifiers:` entry in pricing.yaml: priced at the base rate "
-                "(batch/flex/priority prices differ; add the multiplier from the provider's "
-                "pricing page, then re-ingest into a fresh ledger)")
+    unmodified = [
+        {"tier": textsafe.clean(r["tier"], 32), "events": r["c"]} for r in tiers
+        if r["tier"] not in ("standard", "default", "auto") and r["tier"] not in mods
+    ]
     # Cross-source double-ingest heuristic: identical token/timestamp/SKU
     # rows under different idempotency keys (e.g. gateway file + provider
     # export covering the same calls) would double-count spend.
@@ -965,34 +997,144 @@ def doctor(ctx):
                     cache_read_tokens, cache_write_tokens
            HAVING c > 1"""
     ).fetchall()
-    if dupes:
-        click.echo(
-            f"⚠ {len(dupes)} groups of near-identical events under different "
-            "idempotency keys — possible cross-source double-ingest. "
-            "Ingest each source exactly once."
-        )
     odd = conn.execute(
         "SELECT COUNT(*) c FROM usage_events WHERE ts_utc < ? OR ts_utc > ?",
         (ledger.MIN_TS, ledger._clock()[1]),
     ).fetchone()["c"]
-    if odd:
-        click.echo(f"⚠ {odd:,} events are dated before 2015 or in the future "
-                   "(written by an older version); they distort daily and monthly "
-                   "reports. Find them with `agentfin export --format csv`.")
-    conn.close()
     try:
         age_days = (time.time() - os.path.getmtime(ctx.obj["paths"]["pricing"])) / 86400
     except OSError:
         age_days = 0
-    if age_days > PRICE_BOOK_STALE_DAYS:
+    try:
+        mine = pricing.load_pricing(ctx.obj["paths"]["pricing"])
+        shipped = yaml.safe_load(pricing.DEFAULT_PRICING)
+        newer = sorted(k for k in shipped.get("skus", {}) if k not in mine
+                       and k not in mine.aliases)
+    except (ValueError, yaml.YAMLError, OSError):
+        newer = []
+    return {
+        "events": tot["events"],
+        "first_event": span["mn"],
+        "last_event": span["mx"],
+        "unpriced_events": tot["unpriced_events"] or 0,
+        "unpriced_skus": [{"sku": textsafe.clean(r["sku"]), "events": r["c"]} for r in unpriced],
+        "unattributed_events": unattributed,
+        "priced_via_normalization": [
+            {"sku": textsafe.clean(r["sku"]), "priced_as": textsafe.clean(r["priced_as"]),
+             "events": r["c"]} for r in fuzzy],
+        "service_tiers_without_modifier": unmodified,
+        "possible_duplicate_groups": len(dupes),
+        "events_with_implausible_dates": odd,
+        "pricing_file_age_days": int(age_days),
+        "pricing_file_stale": age_days > PRICE_BOOK_STALE_DAYS,
+        "example_skus_missing_from_pricing_file": newer,
+    }
+
+
+@main.command()
+@click.option("--json", "as_json", is_flag=True, help="machine-readable output")
+@click.pass_context
+def doctor(ctx, as_json):
+    """Sanity checks: unpriced SKUs, unattributed events, data coverage."""
+    conn = _open(ctx)
+    d = _doctor_data(ctx, conn)
+    conn.close()
+    if as_json:
+        click.echo(json.dumps(d, indent=2))
+        return
+    click.echo(f"events: {d['events']:,}  span: {d['first_event']} → {d['last_event']}")
+    click.echo(f"unpriced events: {d['unpriced_events']:,}")
+    for r in d["unpriced_skus"]:
+        click.echo(f"  · {r['sku']}: {r['events']:,} events (add to pricing.yaml)")
+    click.echo(f"unattributed (team=unassigned): {d['unattributed_events']:,}")
+    if d["priced_via_normalization"]:
+        click.echo("priced via normalization/alias (check these are right):")
+        for r in d["priced_via_normalization"]:
+            click.echo(f"  · {r['sku']} → {r['priced_as']}: {r['events']:,} events")
+    for r in d["service_tiers_without_modifier"]:
         click.echo(
-            f"⚠ pricing.yaml was last modified {int(age_days)} days ago. Provider prices "
-            "change; compare it with the provider's pricing page and reconcile to your "
-            "latest invoice (`agentfin reconcile`). (File age only: agentfin cannot "
-            "tell whether the rates are still current.)")
-    if tot["unpriced_events"]:
+            f"⚠ {r['events']:,} events used service tier {r['tier']!r} with no "
+            "`modifiers:` entry in pricing.yaml: priced at the base rate "
+            "(batch/flex/priority prices differ; add the multiplier from the provider's "
+            "pricing page, then re-ingest into a fresh ledger)")
+    if d["possible_duplicate_groups"]:
+        click.echo(
+            f"⚠ {d['possible_duplicate_groups']} groups of near-identical events under "
+            "different idempotency keys — possible cross-source double-ingest. "
+            "Ingest each source exactly once."
+        )
+    if d["events_with_implausible_dates"]:
+        click.echo(f"⚠ {d['events_with_implausible_dates']:,} events are dated before 2015 "
+                   "or in the future (written by an older version); they distort daily and "
+                   "monthly reports. Find them with `agentfin export --format csv`.")
+    if d["pricing_file_stale"]:
+        click.echo(
+            f"⚠ pricing.yaml was last modified {d['pricing_file_age_days']} days ago. "
+            "Provider prices change; compare it with the provider's pricing page and "
+            "reconcile to your latest invoice (`agentfin reconcile`). (File age only: "
+            "agentfin cannot tell whether the rates are still current.)")
+    if d["example_skus_missing_from_pricing_file"]:
+        miss = d["example_skus_missing_from_pricing_file"]
+        click.echo(
+            f"note: this version's example price book lists {len(miss)} SKU(s) your "
+            f"pricing.yaml lacks (e.g. {', '.join(miss[:3])}). Your file is never changed "
+            "automatically; see them with `agentfin pricing-template` and copy what you "
+            "need after checking the provider's pricing page.")
+    if d["unpriced_events"]:
         click.echo("tip: add the SKUs to pricing.yaml, then run `agentfin reprice` "
                    "to fill NULL costs from the new rates.")
+
+
+@main.command("pricing-template")
+def pricing_template_cmd():
+    """Print this version's example pricing.yaml (to compare with your own file)."""
+    click.echo(pricing.DEFAULT_PRICING, nl=False)
+
+
+@main.command()
+@click.option("--json", "as_json", is_flag=True, help="machine-readable output")
+@click.option("--oneline", is_flag=True,
+              help="one short line (today / month to date), e.g. for a status bar")
+@click.pass_context
+def status(ctx, as_json, oneline):
+    """One-screen summary: ledger, event count, latest event, month to date."""
+    _require_db(ctx)
+    # Often run from a status bar: never hang for the usual 30 s if a writer is busy.
+    conn = ledger.connect(ctx.obj["paths"]["db"], timeout=3)
+    now = datetime.now(timezone.utc)
+    today, month_start = now.strftime("%Y-%m-%d"), now.strftime("%Y-%m-01")
+    total = reports.totals(conn)
+    t_today = reports.totals(conn, today, today)
+    t_month = reports.totals(conn, month_start, today)
+    last = conn.execute("SELECT MAX(ts_utc) m FROM usage_events").fetchone()["m"]
+    closed = conn.execute(
+        "SELECT month FROM closes ORDER BY month DESC, version DESC LIMIT 1").fetchone()
+    conn.close()
+    d = {
+        "ledger": str(ctx.obj["paths"]["db"]),
+        "events": total["events"],
+        "last_event": last,
+        "total_cost_micro_usd": total["cost_micro_usd"] or 0,
+        "today_cost_micro_usd": t_today["cost_micro_usd"] or 0,
+        "month_to_date_cost_micro_usd": t_month["cost_micro_usd"] or 0,
+        "unpriced_events": total["unpriced_events"] or 0,
+        "latest_closed_month": closed["month"] if closed else None,
+        "as_of_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    if as_json:
+        click.echo(json.dumps(d, indent=2))
+        return
+    flag = f" ⚠ {d['unpriced_events']} unpriced" if d["unpriced_events"] else ""
+    if oneline:
+        click.echo(f"agentfin {_money(ctx, d['today_cost_micro_usd'])} today · "
+                   f"{_money(ctx, d['month_to_date_cost_micro_usd'])} this month{flag}")
+        return
+    click.echo(f"ledger:        {textsafe.clean(d['ledger'], 200)}")
+    click.echo(f"events:        {d['events']:,}  (latest: {d['last_event'] or 'none'})")
+    click.echo(f"today (UTC):   {_money(ctx, d['today_cost_micro_usd'])}")
+    click.echo(f"month to date: {_money(ctx, d['month_to_date_cost_micro_usd'])}")
+    click.echo(f"all time:      {_money(ctx, d['total_cost_micro_usd'])}{flag}")
+    click.echo(f"last closed:   {d['latest_closed_month'] or 'none'}")
 
 
 # ---------------------------------------------------------------------------
@@ -1040,8 +1182,9 @@ def close_run_cmd(ctx, month, tz, fx_pairs, allow_unpriced, supersede, note):
 
 @close_grp.command("verify")
 @click.argument("month")
+@click.option("--json", "as_json", is_flag=True, help="machine-readable output")
 @click.pass_context
-def close_verify_cmd(ctx, month):
+def close_verify_cmd(ctx, month, as_json):
     """Check a closed month still matches the ledger (exit 3 if it drifted)."""
     _require_db(ctx)
     conn = _open(ctx)
@@ -1051,6 +1194,11 @@ def close_verify_cmd(ctx, month):
         conn.close()
         _fail(exc)
     conn.close()
+    if as_json:
+        click.echo(json.dumps(v, indent=2, default=str))
+        if not v["ok"]:
+            ctx.exit(ALERT_EXIT_CODE)
+        return
     if v["ok"]:
         click.echo(f"{month} v{v['version']}: OK - matches the close of {v['closed_at']}")
         return

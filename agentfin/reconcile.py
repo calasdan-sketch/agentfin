@@ -14,6 +14,7 @@ alarm. Money is summed as ``Decimal`` so cents do not drift.
 from __future__ import annotations
 
 import csv
+import re
 import sqlite3
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -34,14 +35,73 @@ def _pick(fieldnames: list[str], candidates: tuple[str, ...]) -> str | None:
     return None
 
 
+_THOUSANDS = re.compile(r"^\d{1,3}(,\d{3})+(\.\d+)?$")
+_EU_THOUSANDS = re.compile(r"^\d{1,3}(\.\d{3})+(,\d+)?$")
+
+
+def parse_amount(raw: str, delimiter: str = ",") -> Decimal:
+    """Parse one money cell exactly. Accepts ``$1,234.50``, ``(12.50)`` (accounting
+    negative), ``-3``, and - only in a ``;`` or tab separated file - the decimal
+    comma (``1.234,50`` or ``12,5``). Anything ambiguous raises ValueError, because
+    reading ``1,50`` as 150 would be a silent 100x error."""
+    t = raw.strip().replace("\u00a0", "").replace(" ", "")
+    neg = False
+    if t.startswith("(") and t.endswith(")"):
+        neg, t = True, t[1:-1]
+    if t.startswith("-"):
+        neg, t = (not neg), t[1:]
+    t = t.lstrip("$")
+    if t.startswith("-"):
+        neg, t = (not neg), t[1:]
+    if not t:
+        return Decimal(0)
+    if "," in t:
+        if _THOUSANDS.match(t) and delimiter == ",":
+            t = t.replace(",", "")
+        elif delimiter != "," and _EU_THOUSANDS.match(t):
+            t = t.replace(".", "").replace(",", ".")
+        elif delimiter != "," and re.fullmatch(r"\d+,\d{1,2}", t):
+            t = t.replace(",", ".")
+        else:
+            raise ValueError("ambiguous thousands/decimal separator")
+    try:
+        val = Decimal(t)
+    except InvalidOperation:
+        raise ValueError("not a number") from None
+    if not val.is_finite():
+        raise ValueError("not a finite number")
+    return -val if neg else val
+
+
+def _open_invoice(invoice_path):
+    """Open a CSV as text: UTF-8 (with or without BOM) or UTF-16 (PowerShell 5)."""
+    with open(invoice_path, "rb") as raw:
+        head = raw.read(2)
+    enc = "utf-16" if head in (b"\xff\xfe", b"\xfe\xff") else "utf-8-sig"
+    return open(invoice_path, newline="", encoding=enc)  # noqa: SIM115
+
+
+def _delimiter(first_line: str) -> str:
+    """Comma unless the header line clearly uses ; or tab (Excel in many locales)."""
+    counts = {d: first_line.count(d) for d in (",", ";", "\t")}
+    best = max(counts, key=lambda d: counts[d])
+    return best if counts[best] > 0 else ","
+
+
 def read_invoice(invoice_path: str | Path) -> dict[str, Decimal]:
     invoiced: dict[str, Decimal] = {}
     try:
-        f = open(invoice_path, newline="", encoding="utf-8-sig")  # noqa: SIM115
+        f = _open_invoice(invoice_path)
     except OSError as exc:
         raise ValueError(f"cannot read {invoice_path}: {exc.strerror}") from None
     with f:
-        reader = csv.DictReader(f)
+        try:
+            first = f.readline()
+            f.seek(0)
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"{invoice_path}: not a UTF-8 CSV ({exc})") from None
+        delim = _delimiter(first)
+        reader = csv.DictReader(f, delimiter=delim)
         try:
             names = list(reader.fieldnames or [])
         except (UnicodeDecodeError, csv.Error) as exc:
@@ -60,16 +120,14 @@ def read_invoice(invoice_path: str | Path) -> dict[str, Decimal]:
                 sku = (row.get(sku_col) or "").strip()
                 if not sku:
                     continue
-                raw = (row.get(cost_col) or "").strip().replace(",", "").lstrip("$")
+                raw = (row.get(cost_col) or "").strip()
                 try:
-                    cost = Decimal(raw or "0")
-                except InvalidOperation:
-                    cost = None
-                if cost is None or not cost.is_finite():
+                    cost = parse_amount(raw, delim)
+                except ValueError as exc:
                     raise ValueError(
                         f"{invoice_path}: row {i}: bad {cost_col} "
-                        f"{textsafe.clean(raw, 40)!r} (sku {textsafe.clean(sku, 60)!r})"
-                    )
+                        f"{textsafe.clean(raw, 40)!r} ({exc}; sku {textsafe.clean(sku, 60)!r})"
+                    ) from None
                 invoiced[sku] = invoiced.get(sku, Decimal(0)) + cost
         except (UnicodeDecodeError, csv.Error) as exc:
             raise ValueError(f"{invoice_path}: not a UTF-8 CSV ({exc})") from None

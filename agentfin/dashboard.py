@@ -6,7 +6,7 @@ import html
 import sqlite3
 from datetime import datetime, timezone
 
-from . import anomalies, budgets, outcomes, pricing, reports
+from . import __author__, __version__, anomalies, budgets, outcomes, pricing, reports
 
 
 def _usd(micro) -> str:
@@ -95,7 +95,7 @@ th{{background:#f5f5f5}}.kpi{{display:flex;gap:2rem;margin:1rem 0}}.kpi div{{fon
 .bar{{flex:1;background:#2563eb;min-width:3px}}.muted{{color:#666;font-size:.85rem}}
 </style></head><body>
 <h1>💰 {html.escape(title)}</h1>
-<p class="muted">Generated {now} · agentfin v1</p>
+<p class="muted">Generated {now} · agentfin {__version__} · {html.escape(__author__)}</p>
 <h2>Totals</h2>
 <div class="kpi">
 <div>{_usd(tot['cost_micro_usd'])}<span>total spend</span></div>

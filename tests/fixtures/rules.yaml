@@ -1,0 +1,15 @@
+# agentfin attribution rules — first matching rule wins.
+# Conditions: provider, model (regex), task (regex on task/hint), agent, team,
+#             meta.<key> (regex on metadata value).
+# Set: task, agent, team.
+defaults:
+  task: unattributed
+  agent: unknown
+  team: unassigned
+rules:
+  - match: {model: ".*sonnet.*"}
+    set: {agent: claude-code}
+  - match: {model: ".*gpt-4o-mini.*"}
+    set: {agent: cheap-runner}
+  - match: {meta.task: "support.*"}
+    set: {task: support-triage, team: support}

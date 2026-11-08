@@ -1,0 +1,12 @@
+{"ts": "2026-09-10T10:00:00Z", "agent": "a0", "model": "claude-sonnet-4-5", "provider": "anthropic", "input_tokens": 1000, "output_tokens": 200, "cache_read_tokens": 0, "task": "t0", "team": "beta", "id": "e0"}
+{"ts": "2026-09-11T11:00:00Z", "agent": "a1", "model": "claude-sonnet-4-5", "provider": "anthropic", "input_tokens": 1001, "output_tokens": 200, "cache_read_tokens": 50, "task": "t1", "team": "alpha", "id": "e1"}
+{"ts": "2026-09-12T12:00:00Z", "agent": "a0", "model": "claude-sonnet-4-5", "provider": "anthropic", "input_tokens": 1002, "output_tokens": 200, "cache_read_tokens": 100, "task": "t2", "team": "beta", "id": "e2"}
+{"ts": "2026-09-10T13:00:00Z", "agent": "a1", "model": "claude-sonnet-4-5", "provider": "anthropic", "input_tokens": 1003, "output_tokens": 200, "cache_read_tokens": 150, "task": "t0", "team": "alpha", "id": "e3"}
+{"ts": "2026-09-11T14:00:00Z", "agent": "a0", "model": "claude-sonnet-4-5", "provider": "anthropic", "input_tokens": 1004, "output_tokens": 200, "cache_read_tokens": 200, "task": "t1", "team": "beta", "id": "e4"}
+{"ts": "2026-09-12T15:00:00Z", "agent": "a1", "model": "claude-sonnet-4-5", "provider": "anthropic", "input_tokens": 1005, "output_tokens": 200, "cache_read_tokens": 250, "task": "t2", "team": "alpha", "id": "e5"}
+{"ts": "2026-09-10T16:00:00Z", "agent": "a0", "model": "claude-sonnet-4-5", "provider": "anthropic", "input_tokens": 1006, "output_tokens": 200, "cache_read_tokens": 300, "task": "t0", "team": "beta", "id": "e6"}
+{"ts": "2026-09-11T17:00:00Z", "agent": "a1", "model": "claude-sonnet-4-5", "provider": "anthropic", "input_tokens": 1007, "output_tokens": 200, "cache_read_tokens": 350, "task": "t1", "team": "alpha", "id": "e7"}
+{"ts": "2026-09-12T18:00:00Z", "agent": "a0", "model": "claude-sonnet-4-5", "provider": "anthropic", "input_tokens": 1008, "output_tokens": 200, "cache_read_tokens": 400, "task": "t2", "team": "beta", "id": "e8"}
+{"ts": "2026-09-10T19:00:00Z", "agent": "a1", "model": "claude-sonnet-4-5", "provider": "anthropic", "input_tokens": 1009, "output_tokens": 200, "cache_read_tokens": 450, "task": "t0", "team": "alpha", "id": "e9"}
+{"ts": "2026-09-11T10:00:00Z", "agent": "a0", "model": "mystery-model-9", "provider": "anthropic", "input_tokens": 1010, "output_tokens": 200, "cache_read_tokens": 500, "task": "t1", "team": "beta", "id": "e10"}
+{"ts": "2026-09-12T11:00:00Z", "agent": "a1", "model": "mystery-model-9", "provider": "anthropic", "input_tokens": 1011, "output_tokens": 200, "cache_read_tokens": 550, "task": "t2", "team": "alpha", "id": "e11"}

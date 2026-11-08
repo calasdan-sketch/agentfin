@@ -1,0 +1,22 @@
+[
+  {
+    "dim": "alpha",
+    "events": 6,
+    "input_tokens": 6036,
+    "cache_read_tokens": 1800,
+    "cache_write_tokens": 0,
+    "output_tokens": 1200,
+    "cost_micro_usd": 30450,
+    "unpriced_events": 1
+  },
+  {
+    "dim": "beta",
+    "events": 6,
+    "input_tokens": 6030,
+    "cache_read_tokens": 1500,
+    "cache_write_tokens": 0,
+    "output_tokens": 1200,
+    "cost_micro_usd": 30360,
+    "unpriced_events": 1
+  }
+]

@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.4.0 - unreleased (expert round 5: the money maths, the upgrade path, the books)
+
+Additive on the same unreleased line; no version bump (0.4.0 is still not on PyPI,
+which has 0.2.0). Specialists: FinOps practitioner, LLM cost accountant, finance
+controller, ccusage-style tool maintainer, technical writer, QA / test-methodology,
+performance. See `docs/ROUND5.md` for findings (each with the command that proved it),
+the scored idea list and what was not tested.
+
+### Fixed
+- **Per-event cost rounded the wrong way on exact half-micro-dollar ties** (float
+  arithmetic: 1 event in about 1,500 small events was 1 micro-USD off). Pricing now uses
+  exact decimals. Existing ledgers are not recomputed; new events may differ from the same
+  tokens priced by 0.4.0-dev by at most 1 micro-USD.
+- **Currency conversion of a journal gave a team the wrong amount when its month netted
+  negative** (parts were shared out in proportion to absolute values). Each team now keeps
+  its own converted amount to within a cent, and the parts still sum exactly to the total.
+- **Journal CSV: a team with a net-negative month was written as a negative debit**; it is
+  now a credit, the accrual side flips accordingly, 0.00 lines are dropped and an all-zero
+  month writes no lines.
+- **`budgets check` printed a $0.20 budget as `$0`** (and `$12.50` as `$12`). It now shows
+  cents for fractional caps.
+- **`reconcile` read `1,50` as 150** (every comma was deleted). Comma files now refuse an
+  ambiguous cell with a plain message; `;` and tab separated files with decimal commas
+  (`1.234,50`) and `(12.50)` accounting negatives are understood; UTF-16 files (PowerShell 5)
+  are read.
+- The HTML dashboard footer said "agentfin v1"; it now shows the real version.
+- `budgets.yaml` is saved atomically (temp file then replace): a crash or full disk can no
+  longer leave a half-written budget gate.
+
+### Added
+- Author line: `Calas Automations Inc.` is the package author and maintainer, in the
+  licence, `--version`, `agentfin.__author__` and the dashboard footer; pinned by a test.
+- `agentfin status` (`--json`, `--oneline` for a status bar): ledger path, event count, latest
+  event, today / month-to-date / all-time cost, unpriced count, last closed month.
+- `--json` for `doctor`, `anomalies` and `close verify` (same exit codes as text mode).
+- `agentfin pricing-template` prints this version's example `pricing.yaml`; `doctor` now says
+  when your own `pricing.yaml` (e.g. one written by 0.2.0) lacks SKUs the example lists, so
+  events for newer models stop being silently UNPRICED after an upgrade. Your file is never edited.
+- `ingest --modified-within 90m|6h|2d`: in folders, read only recently changed files (a fast
+  hook / cron run). README documents a Claude Code hook and status-line setup (untested inside
+  Claude Code, and says so).
+- `.github/workflows/test.yml`: tests on Linux, macOS, Windows and Python 3.10-3.13 (written
+  here, never run).
+- `benchmarks/mutation_check.py`: 37 deliberate code breaks, each must make the tests fail.
+- Tests: 237 -> 307 (`tests/test_round5.py`): a real 0.2.0 ledger as a fixture (upgrade path),
+  seeded property tests, a Decimal reference for pricing, golden files for every output
+  format (`tests/golden/`; regenerate with `AGENTFIN_UPDATE_GOLDEN=1`).
+
+### Changed
+- Behaviour change: an invoice cell such as `1,5` in a comma-separated file is now an error
+  instead of 15.
+
 ## 0.4.0 - unreleased (expert round 4: the stranger's first hour)
 
 Round 4 is additive on the same unreleased line; no version bump (0.4.0 is not

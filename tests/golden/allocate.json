@@ -1,0 +1,27 @@
+{
+  "by": "team",
+  "pool": "unassigned",
+  "pool_micro_usd": 1633081,
+  "rows": [
+    {
+      "team": "a",
+      "direct_micro_usd": 2290198,
+      "allocated_micro_usd": 648863,
+      "loaded_micro_usd": 2939061
+    },
+    {
+      "team": "b",
+      "direct_micro_usd": 2679603,
+      "allocated_micro_usd": 759190,
+      "loaded_micro_usd": 3438793
+    },
+    {
+      "team": "c",
+      "direct_micro_usd": 794250,
+      "allocated_micro_usd": 225028,
+      "loaded_micro_usd": 1019278
+    }
+  ],
+  "total_micro_usd": 7397132,
+  "unpriced_events": 18
+}

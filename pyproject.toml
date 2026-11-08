@@ -4,7 +4,8 @@ version = "0.4.0"
 description = "Agent FinOps: cost attribution and ROI for AI agent spend"
 readme = "README.md"
 requires-python = ">=3.10"
-authors = [{ name = "Calas Automations" }]
+authors = [{ name = "Calas Automations Inc." }]
+maintainers = [{ name = "Calas Automations Inc." }]
 license = "MIT"
 license-files = ["LICENSE"]
 keywords = ["finops", "llm", "ai-agents", "cost-tracking", "claude-code", "token-usage", "focus"]
@@ -47,6 +48,7 @@ select = ["E", "F", "W", "I", "UP"]
 [tool.ruff.lint.per-file-ignores]
 "agentfin/dashboard.py" = ["E501"]  # inline HTML/CSS template lines
 "tests/*" = ["E501"]
+"benchmarks/mutation_check.py" = ["E501"]  # one-line mutation strings
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -219,16 +219,25 @@ def journal_rows(
     total = Decimal(0)
     for team, amount in parts.items():
         total += amount
+        if amount == 0:
+            continue  # a zero line is noise and some importers reject it
         acct = accounts.get(team) or expense_default
+        # Net corrections can make a team's month negative: that is a credit, never
+        # a negative debit (importers reject those).
         rows.append({
             "JournalNo": no, "JournalDate": last_day,
-            "AccountName": textsafe.clean(acct), "Debits": f"{amount:.2f}", "Credits": "",
+            "AccountName": textsafe.clean(acct),
+            "Debits": f"{amount:.2f}" if amount > 0 else "",
+            "Credits": f"{-amount:.2f}" if amount < 0 else "",
             "Description": f"AI usage {month} list-price cost",
             "Name": textsafe.clean(team), "Currency": currency,
         })
+    if not rows and total == 0:
+        return []  # nothing to book: a lone 0.00 line would only confuse an importer
     rows.append({
         "JournalNo": no, "JournalDate": last_day, "AccountName": textsafe.clean(accrual),
-        "Debits": "", "Credits": f"{total:.2f}",
+        "Debits": f"{-total:.2f}" if total < 0 else "",
+        "Credits": f"{total:.2f}" if total >= 0 else "",
         "Description": f"AI usage {month} accrual", "Name": "", "Currency": currency,
     })
     return rows

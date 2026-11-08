@@ -1,0 +1,30 @@
+# Runs the lint and the test suite on Linux, macOS and Windows, Python 3.10 to 3.13.
+# NOT YET RUN by anyone: it was written without access to GitHub Actions. The first
+# run on Windows/macOS/3.10 is the real answer to "does it work there?" - read the
+# failures, do not assume they are flukes.
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install ".[dev]"
+      - run: ruff check .
+      - run: python -m pytest -q

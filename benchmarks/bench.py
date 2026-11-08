@@ -123,6 +123,8 @@ def throughput(tmp: Path, n: int) -> None:
     timed("re-ingest (all dupes)", ["ingest", str(src)])
     timed("report --by task", ["report", "--by", "task"])
     timed("report --by day --tz", ["report", "--by", "day", "--tz", "America/Chicago"])
+    timed("status --oneline", ["status", "--oneline"])
+    timed("doctor --json", ["doctor", "--json"])
     inv = tmp / "invoice.csv"
     inv.write_text("sku,cost_usd\nanthropic:claude-sonnet-5,1\n", encoding="utf-8")
     timed("reconcile (1 invoice row)", ["reconcile", str(inv), "--json"])

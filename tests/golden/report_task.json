@@ -1,0 +1,22 @@
+[
+  {
+    "dim": "acme-api",
+    "events": 12,
+    "input_tokens": 222,
+    "cache_read_tokens": 588508,
+    "cache_write_tokens": 36000,
+    "output_tokens": 15705,
+    "cost_micro_usd": 612692,
+    "unpriced_events": 0
+  },
+  {
+    "dim": "docs-site",
+    "events": 12,
+    "input_tokens": 266,
+    "cache_read_tokens": 702165,
+    "cache_write_tokens": 54000,
+    "output_tokens": 17954,
+    "cost_micro_usd": 385287,
+    "unpriced_events": 0
+  }
+]

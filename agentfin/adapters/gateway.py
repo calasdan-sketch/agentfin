@@ -1,4 +1,4 @@
-"""calas-gateway ledger adapter (Dan's own gateway usage ledger).
+"""calas-gateway ledger adapter (Calas Automations' own gateway usage ledger).
 
 The gateway writes one JSON object per line with this shape:
 

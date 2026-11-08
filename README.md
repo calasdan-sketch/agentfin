@@ -93,7 +93,12 @@ agentfin export --format csv                    # raw ledger events (also: jsonl
 agentfin dashboard --out report.html            # static HTML, no server
 agentfin reconcile invoice.csv --from 2026-10-01 --to 2026-10-31 --fail-on-variance
 agentfin doctor                                 # unpriced SKUs, fuzzy-priced SKUs, stale price book, gaps
+agentfin status                                 # one screen: events, latest event, today, month to date
+agentfin pricing-template                       # print this version's example pricing.yaml
+agentfin ingest --adapter claude-code --modified-within 1d   # fast re-run: only files changed in the last day
 ```
+
+`doctor`, `anomalies`, `close verify` and `status` also take `--json` for scripts.
 
 `python -m agentfin ...` works the same as the `agentfin` command.
 
@@ -102,6 +107,27 @@ Exit codes: `0` ok · `1` error · `2` usage error · `3` a `--fail-on-alert` /
 budgets, or an invalid budget entry is an error (1), and unpriced spend inside a
 budget scope trips the gate (3) because its true cost is unknown. The anomaly
 gate ignores the 24h display cooldown, so a CI retry fails again.
+
+## Wire it into Claude Code (hook and status line) - not yet tried inside Claude Code
+
+These two settings are our reading of Claude Code's settings format; we have **not**
+run them inside Claude Code, so check them against its current docs first. Use
+absolute paths: a hook runs in whatever folder you happen to be in, and agentfin keeps
+its ledger in `./.agentfin` unless you say otherwise.
+
+```json
+{
+  "statusLine": { "type": "command",
+    "command": "agentfin --db ~/.agentfin/agentfin.db --config-dir ~/.agentfin status --oneline" },
+  "hooks": { "Stop": [ { "hooks": [ { "type": "command",
+    "command": "agentfin --db ~/.agentfin/agentfin.db --config-dir ~/.agentfin ingest --adapter claude-code --modified-within 1d" } ] } ] }
+}
+```
+
+Run `agentfin --config-dir ~/.agentfin init` once first. `--modified-within 1d` makes the
+hook read only transcript files changed in the last day instead of the whole history.
+The status line shows UTC "today" and "this month" list-price cost, not what a
+subscription bills you.
 
 ## Month-end close (for whoever signs off the books)
 
@@ -120,7 +146,9 @@ late-arriving events in the month (count and dollars), or closed rows that were
 repriced, edited or deleted. `close journal` refuses to run on a drifted month
 and writes one debit per team (account names from `config.yaml`:
 `gl_accounts`, `gl_expense_default`, `gl_accrual`) and one credit, rounded once
-so debits equal credits to the cent in every currency. A drifted month is fixed
+so debits equal credits to the cent in every currency. A team whose month nets
+negative (corrections larger than usage) is booked as a credit, never a negative
+debit; teams at 0.00 are left out. A drifted month is fixed
 with `close run --supersede`, which keeps the old close on record. The ledger
 also refuses `DELETE` and any `UPDATE` other than filling an unpriced cost
 (tamper-evident, not tamper-proof: someone with write access to the file can
@@ -156,8 +184,10 @@ linked docs did not describe the feature, not that it is impossible.
 Not run, so not in the table: Vantage, CloudZero, Datadog LLM Observability and
 OpenCost (commercial or Kubernetes-focused; their public docs were skimmed, not
 tested, and claims about them here are **unverified**). ccusage 20.0.48 was
-installed and run, but it returned zero rows on agentfin's synthetic transcripts
-(cause not investigated), so there is no head-to-head number against it.
+installed and run in an earlier round, but it returned zero rows on agentfin's synthetic transcripts
+(cause not investigated), so there is no head-to-head number against it. Re-checked on
+2026-11-08 (version lookups and its published README only, nothing re-run): ccusage is
+still 20.0.48 and its README lists 18 agent CLIs; LiteLLM is 1.108.3.
 
 Where competitors are ahead: ccusage covers far more agent CLIs and has
 5-hour billing-block and statusline views; Langfuse/Helicone/LiteLLM capture
@@ -173,10 +203,11 @@ in the request path with key/team budget settings, while agentfin only alerts.
 |---|---|
 | Claude Code transcripts: 2,000 real responses written as 6,555 assistant lines (repeated usage + forked copies) | summing every line gives **3.27x** the true output tokens; agentfin returns exactly the 2,000 responses and 3,005,221 output tokens (seed 20261107) |
 | Corrupt lines mixed into good ones (negative counts, millisecond epochs, NaN, 10^30; 986 bad among 5,000 good) | all 986 refused with a message, all 5,000 good lines ingested |
-| Ingest 100k events | 26.6 s wall but only 6.4 s of CPU on this shared VM (wall time is dominated by the VM's disk and swung 19-45 s across runs today; CPU time is the steady number, about 15k events per CPU-second). Round 2 recorded 5.6-6.4 s wall on a quieter machine |
-| Re-ingest the same 100k (all duplicates) | 34.6 s wall / 6.8 s CPU, ledger unchanged |
-| `report --by task` / `--by day --tz America/Chicago` over 100k events | 0.2 s / 1.3 s wall (0.05 s / 0.30 s CPU) |
-| `close run` / `close verify` / `close journal` over 100k events | 1.2 / 1.2 / 1.5 s wall |
+| Ingest 100k events | 18.7 s wall but only 6.6 s of CPU on this shared VM (wall time is dominated by the VM's disk and swung 19-54 s across runs this month; CPU time is the steady number, about 15k events per CPU-second) |
+| Re-ingest the same 100k (all duplicates) | 18.5 s wall / 6.8 s CPU, ledger unchanged (`--modified-within` skips old files entirely) |
+| `report --by task` / `--by day --tz America/Chicago` over 100k events | 0.16 s / 0.94 s wall (0.05 s / 0.29 s CPU) |
+| `status --oneline` / `doctor --json` over 100k events | 0.06 s / 0.51 s wall |
+| `close run` / `close verify` / `close journal` over 100k events | 1.3 / 0.7 / 1.5 s wall |
 
 The accuracy and corrupt-line rows are exact and reproducible; only timings vary.
 
@@ -258,7 +289,8 @@ The accuracy and corrupt-line rows are exact and reproducible; only timings vary
 `demo · init [--force] · ingest [--strict] · report · trends · anomalies
 [--fail-on-anomaly] · alerts · budgets [check [--fail-on-alert] | set] ·
 outcomes [tag|roi|git] · close [run|verify|journal] · allocate · savings ·
-whatif · export · reconcile · reprice · dashboard · doctor`
+whatif · export · reconcile · reprice · dashboard · doctor · status ·
+pricing-template`
 
 `ingest` skips malformed lines and reports each as `file:line: reason`, keeping
 the good ones; `--strict` writes nothing if any line is bad. A line is
@@ -277,7 +309,8 @@ for `outcomes tag` / `outcomes roi`.
 ## Development
 
 ```bash
-python -m pytest        # 237 tests at this commit
+python -m pytest        # 307 tests at this commit
+python benchmarks/mutation_check.py   # break the code on purpose; every break must fail a test (minutes)
 ruff check agentfin/ tests/
 ```
 
@@ -335,15 +368,18 @@ ruff check agentfin/ tests/
   the guess is recorded on the event.
 - **Reconcile is exact-name and USD-only.** Invoice SKUs must be spelled like the
   ledger's `provider:model`; a provider's own product names, currencies other
-  than USD and credits/refunds as separate lines are not understood. A delimiter
-  other than a comma is an error. Tolerance is a flat amount per SKU.
+  than USD and credits/refunds as separate lines are not understood. Comma,
+  semicolon and tab separated files, UTF-8 and UTF-16 are read; `1,50` in a comma file is
+  refused as ambiguous rather than read as 150 (decimal commas are accepted only in
+  `;`/tab files). Tolerance is a flat amount per SKU.
 - **Sanity limits are guesses.** 10^12 tokens, 2015 to "2 days from now", and
   $1,000,000 per gateway request are conservative bounds, not provider facts;
   edit `ledger.py` if your data legitimately exceeds them.
 - **Windows is untested here.** Paths and encodings are handled in code and by
   emulated tests (legacy code page, CRLF, UTF-8 BOM, UTF-16 files such as
-  PowerShell 5's `>` writes), and a static review found no `shell=True`, signals or
-  `os.replace` calls, but the suite has only been run on Linux (Python 3.13, 3.12,
+  PowerShell 5's `>` writes), and a static review found no `shell=True` or signals;
+  the only `os.replace` is the atomic save of `budgets.yaml` (on Windows it fails with a plain
+  message if an editor holds the file open), but the suite has only been run on Linux (Python 3.13, 3.12,
   3.11; the declared minimum 3.10 is unverified).
 - **Outcome values are estimates.** `hours_saved × rate` is a model, not a
   bank deposit. ROI ranks tasks; don't put it in a 10-K.

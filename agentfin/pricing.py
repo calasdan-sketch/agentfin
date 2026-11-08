@@ -7,6 +7,7 @@ bucket) that shows up loudly in every report.
 from __future__ import annotations
 
 import re
+from decimal import ROUND_HALF_EVEN, Decimal
 from pathlib import Path
 from typing import Any
 
@@ -348,20 +349,24 @@ def cost_micro_usd(
         threshold = int(tier.get("above_prompt_tokens", 0) or 0)
         if prompt > threshold > best:
             best, active = threshold, {**rates, **tier}
-    # micro_usd = tokens * price_per_mtok_usd  (since 1e6 micro-USD = $1)
+    # micro_usd = tokens * price_per_mtok_usd  (since 1e6 micro-USD = $1).
+    # Decimal, not float: float products land a hair below/above exact .5 ties
+    # (e.g. 15 tokens x $0.10/M) and rounded the wrong way for ~1 event in 1,500.
+    def d(key: str) -> Decimal:
+        return Decimal(repr(_num(active, key)))
+
     total = (
-        inp * _num(active, "input")
-        + cr * _num(active, "cache_read")
-        + (cw - cw_1h) * _num(active, "cache_write")
-        + cw_1h * _num(active, "cache_write_1h" if "cache_write_1h" in active
-                       else "cache_write")
-        + out * _num(active, "output")
+        inp * d("input")
+        + cr * d("cache_read")
+        + (cw - cw_1h) * d("cache_write")
+        + cw_1h * d("cache_write_1h" if "cache_write_1h" in active else "cache_write")
+        + out * d("output")
     )
     tier_name = str(event.get("service_tier") or "").lower()
     mult = (getattr(pricing, "modifiers", None) or {}).get(tier_name)
     if mult is not None:
-        total *= mult
-    return int(round(total))
+        total *= Decimal(repr(float(mult)))
+    return int(total.quantize(Decimal(1), rounding=ROUND_HALF_EVEN))
 
 
 def format_usd(micro: int | None) -> str:

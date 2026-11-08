@@ -1,0 +1,7 @@
+# display_currency: USD  (FX shown as estimate, marked *)
+# fx:
+#   CAD: 1.36
+#   EUR: 0.92
+display_currency: USD
+fx: {}
+redact_keys: []

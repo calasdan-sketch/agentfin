@@ -1,0 +1,9 @@
+# agentfin budgets — monthly caps in USD.
+# alert_at: fraction of *forecasted* month-end spend that triggers an alert.
+budgets:
+- scope: team:platform
+  monthly_usd: 500
+  alert_at: 0.8
+- scope: team:alpha
+  monthly_usd: 1.0
+  alert_at: 0.8

@@ -1,0 +1,3 @@
+JournalNo,JournalDate,AccountName,Debits,Credits,Description,Name,Currency
+AF-202610-v1,2026-10-31,AI usage expense,1.37,,AI usage 2026-10 list-price cost,unassigned,CAD
+AF-202610-v1,2026-10-31,Accrued AI usage,,1.37,AI usage 2026-10 accrual,,CAD

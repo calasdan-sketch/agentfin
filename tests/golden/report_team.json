@@ -1,0 +1,12 @@
+[
+  {
+    "dim": "unassigned",
+    "events": 24,
+    "input_tokens": 488,
+    "cache_read_tokens": 1290673,
+    "cache_write_tokens": 90000,
+    "output_tokens": 33659,
+    "cost_micro_usd": 997979,
+    "unpriced_events": 0
+  }
+]
